@@ -2,6 +2,7 @@
 #include "gpu/execute/refused_shader_source.hpp"
 #include "gpu/execute/compute_program_facts.hpp"
 #include "gpu/execute/shader_source_window.hpp"
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -59,10 +60,29 @@ void note_refused_draw_shaders(const RefusedDrawShaders& shaders) {
 
 void note_refused_compute_program(const std::shared_ptr<const ComputeProgramFacts>& facts,
                                   uint64_t address, uint32_t groups_x, uint32_t groups_y,
-                                  uint32_t groups_z) {
-    if (!facts) return;
+                                  uint32_t groups_z, const ShaderResourceTable* table,
+                                  const ComputeShaderConfig* config) {
+    if (!facts || refused_shader_dump_full()) return;
     const RefusedShaderSource source{{facts, &facts->code}, &facts->refused_shader_memo};
-    note_refused_compute_shader(address, source, groups_x, groups_y, groups_z);
+    if (!config) {
+        note_refused_compute_shader(address, source, groups_x, groups_y, groups_z);
+        return;
+    }
+    struct Context {
+        uint64_t address;
+        const ShaderResourceTable* table;
+        const ComputeShaderConfig* config;
+    };
+    const Context context{address, table, config};
+    // Synchronous callbacks carry one pointer, including on a repeated/saturated observation.
+    const RefusedShaderInputSet inputs{
+        0,
+        [c = &context](const std::string& stem) {
+            return write_refused_compute_inputs(stem + ".inputs", c->address, c->table, *c->config,
+                                                last_terminal_reject_reason(c->address));
+        },
+        [c = &context] { return refused_compute_inputs_identity(c->table, *c->config); }};
+    note_refused_compute_shader(address, source, groups_x, groups_y, groups_z, &inputs);
 }
 
 namespace {

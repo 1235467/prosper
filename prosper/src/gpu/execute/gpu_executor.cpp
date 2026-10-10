@@ -9448,7 +9448,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
                 }
             }
             note_refused_compute_program(facts, code_addr, launch.groups_x, launch.groups_y,
-                                         launch.groups_z);
+                                         launch.groups_z, item.resources.get(), &config);
             if (report_compute_recompile_skip_once(recompile_diagnostic)) {
                 // #2412: print the table this program was offered, next to the keys the shader looks
                 // up by. Every one of GTA V's 951 recompiler rejects is `mode=unresolved-operand`

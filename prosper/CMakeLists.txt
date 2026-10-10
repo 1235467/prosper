@@ -3227,6 +3227,12 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # #4808: a refused compute program's live compile inputs, kept beside it and replayed offline.
+  prosper_add_gtest(test_refused_shader_inputs
+    SOURCES tests/gpu/diagnostics/test_refused_shader_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_shader_dump_filter
     SOURCES tests/gpu/diagnostics/test_shader_dump_filter.cpp
     LIBRARIES prosper_core)

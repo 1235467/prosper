@@ -83,6 +83,9 @@ void write_fragment_compile_case(const std::filesystem::path&, const FragmentCom
 FragmentCompileCase read_fragment_compile_case(const std::filesystem::path&);
 void write_fragment_compile_source(const std::filesystem::path&, std::span<const uint32_t>);
 uint64_t fragment_compile_case_retained_bytes(const FragmentCompileCase&);
+// Descriptor metadata only: uses the codec's complete field walk, without reading backing bytes
+// or hashing host addresses. Backing presence and lengths participate, pointer values do not.
+uint64_t compile_case_resource_metadata_identity(const ShaderResourceTable*);
 bool fragment_compile_case_recording_enabled();
 // Warm exports with a null producer write only explicit INCOMPLETE records; they do not read
 // current code/resources/environment to invent provenance for an older cache entry.

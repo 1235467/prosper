@@ -148,7 +148,64 @@ struct Reader {
         v.resize(n); for (auto& x : v) value(x);
     }
 };
+// Reuse the codec field walk for descriptor identity; no allocation or backing-byte reads.
+struct MetadataHasher {
+    uint64_t hash = 14695981039346656037ull;
+    template <class... T>
+    void operator()(const T&... values) {
+        (value(values), ...);
+    }
+    template <class T>
+    void value(const T& v) {
+        if constexpr (std::is_enum_v<T>)
+            value(static_cast<std::underlying_type_t<T>>(v));
+        else if constexpr (std::is_same_v<T, float>)
+            value(std::bit_cast<uint32_t>(v));
+        else {
+            const uint64_t bits = static_cast<uint64_t>(v);
+            for (size_t i = 0; i != sizeof(T); ++i) {
+                hash ^= uint8_t(bits >> (8 * i));
+                hash *= 1099511628211ull;
+            }
+        }
+    }
+    template <class T, size_t N>
+    void value(const T (&v)[N]) {
+        for (const auto& x : v) value(x);
+    }
+    template <class T, size_t N>
+    void value(const std::array<T, N>& v) {
+        for (const auto& x : v) value(x);
+    }
+    void value(const ShaderResource& r) {
+        resource(*this, r);
+        (*this)(r.owned_raw_snapshot_bytes, r.owned_nested_snapshot_bytes, r.host_data != nullptr,
+                r.dcc_metadata_host_data != nullptr);
+    }
+    void value(const ShaderBufferTableEntry& v) {
+        (*this)(v.vsharp, v.gpu_addr, v.size, v.stride, v.host_data_size, v.host_data != nullptr);
+    }
+    template <class T>
+    void sequence(const std::vector<T>& v, size_t) {
+        value(uint64_t(v.size()));
+        for (const auto& x : v) value(x);
+    }
+};
 } // namespace
+uint64_t compile_case_resource_metadata_identity(const ShaderResourceTable* table) {
+    MetadataHasher h;
+    h.value(table != nullptr);
+    if (table) {
+        h.value(table->vertices_per_instance);
+        h.sequence(table->resources, kCompileCaseMaxResources);
+        for (const auto& requirements : {&table->owned_raw_snapshot_requirements,
+                                         &table->owned_nested_snapshot_requirements}) {
+            h.value(uint64_t(requirements->size()));
+            for (const auto& [pc, words] : *requirements) h(pc, words);
+        }
+    }
+    return h.hash;
+}
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
