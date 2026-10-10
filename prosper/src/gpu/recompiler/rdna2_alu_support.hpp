@@ -590,6 +590,29 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
     return true;
 }
 
+// A structured merge can leave placeholders in unrelated words without invalidating fresh SCC
+// or VCC data. Reconstruct the complete mask only from two definite scalar words; map membership
+// alone is not enough after a merge. CONFIDENCE: HIGH -- RDNA2 ISA 70648 sections 5.2 and 12.1:
+// explicit SCC is zero-extended 0/1, and B32 logical writes preserve the untouched VCC dword.
+inline bool vcc_b32_scalar_pair_defined(const SpirvCompute& b, const RegState& rs,
+                                        const Rdna2Inst& in) {
+    if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) return true;
+    if (!b.is_compute || b.wave_size != 64 || !b32_sources_defined(rs, in)) return false;
+    Operand sibling;
+    sibling.kind = OperandKind::Special;
+    sibling.value = in.dst.value == 106 ? 107 : 106;
+    return b32_source_word_defined(rs, sibling);
+}
+
+inline bool vcc_b32_scalar_write_proven(const SpirvCompute& b, const RegState& rs,
+                                        const Rdna2Inst& in) {
+    return !b.is_compute || b.wave_size != 64 || rs.scalar_presence_has_no_placeholders ||
+           b.vcc_b32_scalar_result_pcs.contains(in.pc) ||
+           b.vcc_local_scalar_write_pcs.contains(in.pc) ||
+           (b32_sources_defined(rs, in) &&
+            (b.vcc_b32_low_only_pcs.contains(in.pc) || vcc_b32_scalar_pair_defined(b, rs, in)));
+}
+
 // The VCC sibling word of a B32 write is combined into the lane bit: when it is not projectable the
 // view is dropped (data only) and the emitter returns. True means "handled, return now".
 inline bool vcc_sibling_unavailable(const SpirvCompute& b, RegState& rs, int sibling,
