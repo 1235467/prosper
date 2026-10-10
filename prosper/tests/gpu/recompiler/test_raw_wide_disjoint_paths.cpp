@@ -99,6 +99,64 @@ TEST(RawWideDisjointPaths, LoadedArmOverwriteBeforeAJoinEndsOnlyThatWord) {
     EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(decode(words)).empty());
 }
 
+TEST(RawWideDisjointPaths, ConditionalB32MoveKeepsTheLoadedWordLiveAtAJoin) {
+    auto words = code();
+    // The load arm has SCC=false from pc1, so CMOV retains the loaded s16. The bypass arm
+    // reaches pc7 with the earlier s16 instead: these lifetimes really join at that read.
+    words[6] = 0xbe900587u; // s_cmov_b32 s16, 7
+    ASSERT_EQ(at(decode(words), 6u).opcode, kSop1OpcodeCmovB32);
+    EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(decode(words)).empty());
+    words[4] = kRegisterOffset;
+    EXPECT_TRUE(rdna2_proven_raw_register_wide_entry_loads(decode(words)).empty());
+    words[6] = 0xbe900387u; // the unconditional MOV does end this physical lifetime
+    EXPECT_EQ(rdna2_proven_raw_register_wide_entry_loads(decode(words)),
+              std::vector<uint32_t>{kLoadPc});
+    words[4] = kNullOffset;
+    EXPECT_EQ(rdna2_proven_raw_immediate_wide_data_loads(decode(words)),
+              std::vector<uint32_t>{kLoadPc});
+    words[7] = 0x7e020211u; // a B32 overwrite must not end the neighboring s17 lifetime
+    EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(decode(words)).empty());
+}
+
+TEST(RawWideDisjointPaths, ConditionalB64MoveKeepsBothLoadedWordsLiveAtAJoin) {
+    for (uint32_t read : {0x7e020210u, 0x7e020211u}) {
+        SCOPED_TRACE(read);
+        auto words = code();
+        words[6] = 0xbe900687u; // s_cmov_b64 s[16:17], 7; SCC=false retains BOTH words
+        words[7] = read;
+        ASSERT_EQ(at(decode(words), 6u).opcode, kSop1OpcodeCmovB64);
+        EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(decode(words)).empty());
+        words[4] = kRegisterOffset;
+        EXPECT_TRUE(rdna2_proven_raw_register_wide_entry_loads(decode(words)).empty());
+        words[6] = 0xbe900487u; // unconditional MOV_B64 ends both physical lifetimes
+        EXPECT_EQ(rdna2_proven_raw_register_wide_entry_loads(decode(words)),
+                  std::vector<uint32_t>{kLoadPc});
+        words[4] = kNullOffset;
+        EXPECT_EQ(rdna2_proven_raw_immediate_wide_data_loads(decode(words)),
+                  std::vector<uint32_t>{kLoadPc});
+    }
+}
+
+TEST(RawWideDisjointPaths, ConditionalImmediateMoveKeepsTheLoadedWordLiveAtAJoin) {
+    auto words = code();
+    words[6] = 0xb1100007u; // s_cmovk_i32 s16, 7; its old SDST survives SCC=false
+    const auto ins = decode(words);
+    ASSERT_EQ(at(ins, 6u).fmt, Rdna2Format::SOPK);
+    ASSERT_EQ(at(ins, 6u).opcode, kSopkOpcodeCmovkI32);
+    ASSERT_EQ(at(ins, 6u).dst.value, 16);
+    EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(ins).empty());
+    words[4] = kRegisterOffset;
+    EXPECT_TRUE(rdna2_proven_raw_register_wide_entry_loads(decode(words)).empty());
+    words[6] = 0xb0100007u; // unconditional MOVK ends only s16's physical lifetime
+    EXPECT_EQ(rdna2_proven_raw_register_wide_entry_loads(decode(words)),
+              std::vector<uint32_t>{kLoadPc});
+    words[4] = kNullOffset;
+    EXPECT_EQ(rdna2_proven_raw_immediate_wide_data_loads(decode(words)),
+              std::vector<uint32_t>{kLoadPc});
+    words[7] = 0x7e020211u;
+    EXPECT_TRUE(rdna2_proven_raw_immediate_wide_data_loads(decode(words)).empty());
+}
+
 TEST(RawWideDisjointPaths, ReadBeforeItsBypassOverwriteStillRefuses) {
     auto words = code();
     words[6] = 0xbf820000u;

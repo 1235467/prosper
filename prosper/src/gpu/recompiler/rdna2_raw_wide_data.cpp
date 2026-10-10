@@ -741,6 +741,13 @@ private:
     }
 
     uint16_t kill_written_words(const Rdna2Inst& in, uint16_t live) const {
+        // The writer inventory reports MAY writes. A conditional move preserves the old
+        // physical word when SCC=false, so it cannot end a MAY-loaded lifetime without a
+        // separate predicate proof. Keep both B64 words live as well as the B32/MOVK word.
+        if ((in.fmt == Rdna2Format::SOP1 &&
+             (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64)) ||
+            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32))
+            return live;
         for_each_scalar_write(
             in,
             [&](int base, uint32_t width) {
