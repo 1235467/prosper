@@ -15,6 +15,12 @@
 #include <utility>
 
 namespace prosper::gpu {
+struct RefusedShaderInputCount {
+    std::mutex mutex;
+    std::string stem;
+    std::set<uint64_t> identities;
+    std::atomic<bool> full{false};
+};
 namespace {
 
 // One bit per stage tag (vs, ps, cs, vsmain) under an epoch that advances in steps of 16.
@@ -25,12 +31,10 @@ struct DumpState {
     std::string root;            // empty: derive from PROSPER_CAPTURE_DIR on first use
     std::string directory;       // created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
-    struct InputSets {
-        std::string stem;
-        std::set<uint64_t> identities;
-    };
-    // Programs dumped with a sidecar, by (stage, address): bounded by the program budgets above.
-    std::map<std::pair<std::string, uint64_t>, InputSets> input_sets;
+    // Same identity as program deduplication, so VA reuse and relocation cannot mix counters.
+    std::map<std::pair<std::string, uint64_t>, std::shared_ptr<RefusedShaderInputCount>> input_sets;
+    std::atomic<uint64_t> input_set_global_locks{0};
+    std::atomic<uint64_t> input_identity_evaluations{0};
     bool dir_failure_announced = false;
     size_t refusal_count = 0;   // distinct programs recorded under each budget
     size_t declined_count = 0;
@@ -100,7 +104,7 @@ std::string make_directory(DumpState& s) {
     return s.directory;
 }
 
-void write_input_set_count(const DumpState::InputSets& sets) {
+void write_input_set_count(const RefusedShaderInputCount& sets) {
     const std::string path = sets.stem + ".input_sets";
     if (FILE* f = std::fopen(path.c_str(), "w")) {
         std::fprintf(f, "distinct_input_sets=%zu%s\n", sets.identities.size(),
@@ -118,12 +122,15 @@ bool budget_full(RefusedShaderBudget budget) {
 }
 }   // namespace
 
-bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
-                         const std::string& detail, RefusedShaderBudget budget,
-                         const RefusedShaderInputSet* inputs) {
+static bool note_refused_shader_impl(const char* stage, uint64_t address, const uint32_t* code,
+                                     size_t dwords, const std::string& detail,
+                                     RefusedShaderBudget budget,
+                                     const RefusedShaderInputSet* inputs,
+                                     const RefusedShaderMemo* memo = nullptr) {
     if (budget_full(budget)) return false;
     if (!stage || !code || !dwords) return false;
     const uint64_t hash = hash_code(code, dwords);
+    if (memo) memo->code_hash.store(hash, std::memory_order_relaxed);
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
     if (s.seen.count({stage, hash})) return false;
@@ -158,10 +165,11 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
         std::string stem = path.string();
         stem.resize(stem.size() - 4);   // ".bin"
         if (inputs->write(stem)) {
-            auto& sets = s.input_sets[{stage, address}];
-            sets.stem = stem;
-            sets.identities = {inputs->identity};
-            write_input_set_count(sets);
+            auto sets = std::make_shared<RefusedShaderInputCount>();
+            sets->stem = stem;
+            sets->identities = {inputs->identity};
+            write_input_set_count(*sets);
+            s.input_sets[{stage, hash}] = std::move(sets);
             inputs_field = std::string(" inputs=") +
                            std::filesystem::path(stem).filename().string() + ".inputs";
         }
@@ -205,6 +213,12 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     return written;
 }
 
+bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
+                         const std::string& detail, RefusedShaderBudget budget,
+                         const RefusedShaderInputSet* inputs) {
+    return note_refused_shader_impl(stage, address, code, dwords, detail, budget, inputs);
+}
+
 bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
                          const std::string& detail, RefusedShaderBudget budget,
                          const RefusedShaderInputSet* inputs) {
@@ -222,8 +236,8 @@ bool note_refused_shader(const char* stage, uint64_t address, const RefusedShade
                 break;
         }
     }
-    return note_refused_shader(stage, address, source.words->data(), source.words->size(), detail,
-                               budget, inputs);
+    return note_refused_shader_impl(stage, address, source.words->data(), source.words->size(),
+                                    detail, budget, inputs, source.memo);
 }
 
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source) {
@@ -237,29 +251,50 @@ bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& 
 bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
                                  uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
                                  const RefusedShaderInputSet* inputs) {
-    if (refused_shader_already_noted("cs", source)) return false;
+    if (refused_shader_dump_full() || !source.words || source.words->empty()) return false;
     char detail[96];
     std::snprintf(detail, sizeof detail, "dispatch groups=%ux%ux%u", groups_x, groups_y, groups_z);
-    return note_refused_shader("cs", address, source, detail, RefusedShaderBudget::Refusal, inputs);
-}
-
-void note_refused_shader_input_set(const char* stage, uint64_t address, uint64_t identity) {
-    if (!stage) return;
-    DumpState& s = state();
-    std::lock_guard lock(s.mutex);
-    const auto found = s.input_sets.find({stage, address});
-    if (found == s.input_sets.end()) return;
-    auto& sets = found->second;
-    if (sets.identities.size() >= kRefusedShaderMaxInputSetsCounted) return;
-    if (sets.identities.insert(identity).second) write_input_set_count(sets);
-}
-
-size_t refused_shader_input_sets(const char* stage, uint64_t address) {
-    if (!stage) return 0;
-    DumpState& s = state();
-    std::lock_guard lock(s.mutex);
-    const auto found = s.input_sets.find({stage, address});
-    return found == s.input_sets.end() ? 0 : found->second.identities.size();
+    if (!inputs || !source.memo) {
+        if (refused_shader_already_noted("cs", source)) return false;
+        return note_refused_shader("cs", address, source, detail, RefusedShaderBudget::Refusal,
+                                   inputs);
+    }
+    const auto& memo = *source.memo;
+    std::lock_guard owner_lock(memo.input_mutex);
+    const uint64_t epoch = refused_shader_dump_epoch();
+    if (memo.input_epoch != epoch) {
+        memo.input_epoch = epoch;
+        memo.input_count.reset();
+    }
+    const bool noted = refused_shader_already_noted("cs", source);
+    // A previous dump with no sidecar has nothing to count. Saturation precedes hashing.
+    if (noted && (!memo.input_count || memo.input_count->full.load(std::memory_order_relaxed)))
+        return false;
+    state().input_identity_evaluations.fetch_add(1, std::memory_order_relaxed);
+    RefusedShaderInputSet resolved = *inputs;
+    if (inputs->identify) resolved.identity = inputs->identify();
+    bool written = false;
+    if (!noted) {
+        written = note_refused_shader("cs", address, source, detail, RefusedShaderBudget::Refusal,
+                                      &resolved);
+        DumpState& s = state();
+        s.input_set_global_locks.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard cold_lock(s.mutex);
+        const auto found =
+            s.input_sets.find({"cs", memo.code_hash.load(std::memory_order_relaxed)});
+        if (found != s.input_sets.end()) memo.input_count = found->second;
+    }
+    if (memo.input_count) {
+        auto& sets = *memo.input_count;
+        std::lock_guard count_lock(sets.mutex);
+        if (sets.identities.size() < kRefusedShaderMaxInputSetsCounted &&
+            sets.identities.insert(resolved.identity).second) {
+            sets.full.store(sets.identities.size() >= kRefusedShaderMaxInputSetsCounted,
+                            std::memory_order_relaxed);
+            write_input_set_count(sets);
+        }
+    }
+    return written;
 }
 
 bool refused_shader_dump_full() {
@@ -280,6 +315,8 @@ RefusedShaderDumpStats refused_shader_dump_stats() {
     DumpState& s = state();
     std::lock_guard lock(s.mutex);
     return {s.seen.size(), s.hash_evaluations.load(std::memory_order_relaxed),
+            s.input_set_global_locks.load(std::memory_order_relaxed),
+            s.input_identity_evaluations.load(std::memory_order_relaxed),
             s.hashed_dwords.load(std::memory_order_relaxed)};
 }
 
@@ -303,6 +340,8 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.epoch.fetch_add(kStageBits + 1u, std::memory_order_relaxed);
     s.hash_evaluations.store(0, std::memory_order_relaxed);
     s.hashed_dwords.store(0, std::memory_order_relaxed);
+    s.input_set_global_locks.store(0, std::memory_order_relaxed);
+    s.input_identity_evaluations.store(0, std::memory_order_relaxed);
     s.dir_failure_announced = false;
 }
 

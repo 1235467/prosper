@@ -49,6 +49,18 @@ struct Out {
     }
 };
 
+struct HashOut {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    template <class T>
+    void num(T value) {
+        const uint64_t bits = static_cast<uint64_t>(value);
+        for (size_t i = 0; i != sizeof(T); ++i) {
+            hash ^= uint8_t(bits >> (8 * i));
+            hash *= 0x100000001b3ull;
+        }
+    }
+};
+
 struct In {
     const std::vector<uint8_t>& bytes;
     size_t end;
@@ -83,21 +95,23 @@ struct In {
 
 // Every ComputeShaderConfig field, in declaration order. A field added to the struct and not here
 // is a live input the replay silently defaults; the round-trip test sets every field.
-void write_config(Out& o, const ComputeShaderConfig& c) {
-    require(c.user_sgprs.size() <= 64, "refused-shader inputs user-SGPR bound");
-    o.num<uint32_t>(uint32_t(c.user_sgprs.size()));
+template <class Sink>
+void write_config(Sink& o, const ComputeShaderConfig& c) {
+    o.template num<uint32_t>(uint32_t(c.user_sgprs.size()));
     for (uint32_t v : c.user_sgprs) o.num(v);
     o.num(c.local_x), o.num(c.local_y), o.num(c.local_z);
-    o.num<uint8_t>(c.exact_thread_extent);
+    o.template num<uint8_t>(c.exact_thread_extent);
     o.num(c.threads_x), o.num(c.threads_y), o.num(c.threads_z);
     o.num(c.wave_size), o.num(c.compute_pgm_rsrc1), o.num(c.tidig_comp_cnt);
-    o.num<uint8_t>(c.tgid_x_en), o.num<uint8_t>(c.tgid_y_en), o.num<uint8_t>(c.tgid_z_en);
-    o.num<uint8_t>(c.tg_size_en);
+    o.template num<uint8_t>(c.tgid_x_en), o.template num<uint8_t>(c.tgid_y_en),
+        o.template num<uint8_t>(c.tgid_z_en);
+    o.template num<uint8_t>(c.tg_size_en);
     o.num(c.lds_bytes), o.num(c.native_subgroup_size), o.num(c.wave64_exchange_width);
-    o.num<uint8_t>(c.force_exchange_dispatcher);
+    o.template num<uint8_t>(c.force_exchange_dispatcher);
     o.num(c.native_storage_format_support);
-    o.num<uint8_t>(c.storage_buffer_int64_atomics), o.num<uint8_t>(c.packed_r11_storage);
-    o.num<uint8_t>(static_cast<uint8_t>(c.float_transport.profile));
+    o.template num<uint8_t>(c.storage_buffer_int64_atomics),
+        o.template num<uint8_t>(c.packed_r11_storage);
+    o.template num<uint8_t>(static_cast<uint8_t>(c.float_transport.profile));
 }
 
 ComputeShaderConfig read_config(In& in) {
@@ -168,26 +182,11 @@ void mix(uint64_t& h, uint64_t v) {
 
 uint64_t refused_compute_inputs_identity(const ShaderResourceTable* table,
                                          const ComputeShaderConfig& c) {
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (uint32_t v : c.user_sgprs) mix(h, v);
-    for (uint64_t v :
-         {uint64_t(c.local_x), uint64_t(c.local_y), uint64_t(c.local_z), uint64_t(c.threads_x),
-          uint64_t(c.threads_y), uint64_t(c.threads_z), uint64_t(c.wave_size),
-          uint64_t(c.compute_pgm_rsrc1), uint64_t(c.tidig_comp_cnt), uint64_t(c.lds_bytes),
-          uint64_t(c.native_subgroup_size)})
-        mix(h, v);
-    mix(h, (c.tgid_x_en ? 1u : 0u) | (c.tgid_y_en ? 2u : 0u) | (c.tgid_z_en ? 4u : 0u) |
-               (c.tg_size_en ? 8u : 0u) | (c.exact_thread_extent ? 16u : 0u));
-    if (!table) return h;
-    for (const ShaderResource& r : table->resources) {
-        for (uint64_t v :
-             {uint64_t(r.cls), uint64_t(r.format), r.gpu_addr, uint64_t(r.size), uint64_t(r.stride),
-              uint64_t(r.srt_offset), uint64_t(r.sgpr_base), uint64_t(r.fetch_pc),
-              uint64_t(r.width), uint64_t(r.height), uint64_t(r.img_dim), uint64_t(r.tile_mode),
-              uint64_t(r.table_entries.size()), uint64_t(r.host_data_size)})
-            mix(h, v);
-    }
-    return h;
+    HashOut encoded;
+    write_config(encoded, c);
+    uint64_t hash = encoded.hash;
+    mix(hash, compile_case_resource_metadata_identity(table));
+    return hash;
 }
 
 namespace {
@@ -195,6 +194,7 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
                             const std::string& live_reject, const std::string& incomplete,
                             bool payload_omitted, const ComputeShaderConfig& config,
                             const std::vector<uint8_t>& carrier) {
+    require(config.user_sgprs.size() <= 64, "refused-shader inputs user-SGPR bound");
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
     o.num<uint32_t>(kRefusedShaderInputsSchema);
@@ -293,14 +293,22 @@ bool write_refused_compute_inputs(const std::filesystem::path& path, uint64_t pr
     }
     std::error_code ec;
     if (ok) std::filesystem::rename(partial, path, ec);
-    if (!ok || ec) std::filesystem::remove(partial, ec);
-    return ok && !ec;
+    const bool installed = ok && !ec;
+    if (!installed) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(partial, cleanup_error);
+    }
+    return installed;
 }
 
 RefusedShaderReplay replay_refused_shader_inputs(const std::vector<uint32_t>& code,
                                                  const RefusedShaderInputs& inputs,
                                                  bool use_inputs) {
     RefusedShaderReplay replay;
+    if (use_inputs && inputs.live_reject.empty()) {
+        replay.incomplete = "live terminal refusal was not recorded";
+        return replay;
+    }
     if (use_inputs && !inputs.incomplete.empty()) replay.incomplete = inputs.incomplete;
     const bool table = use_inputs && inputs.has_resources;
     std::vector<CompilerResourceAccess> access;
@@ -338,6 +346,8 @@ RefusedShaderReplay replay_refused_shader_inputs(const std::vector<uint32_t>& co
     const auto records = rejection.take();
     if (!replay.produced && !records.empty())
         replay.reject = records.back().first + " " + records.back().second;
+    if (use_inputs && !replay.produced && replay.reject.empty() && replay.incomplete.empty())
+        replay.incomplete = "recompile returned no module and no terminal refusal";
     return replay;
 }
 

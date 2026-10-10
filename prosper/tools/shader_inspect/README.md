@@ -392,7 +392,12 @@ buffer bytes the compiler may read. Replay the live decision with it instead of 
 
 It prints `inputs-live`, `inputs-replay` (on the recorded inputs) and `inputs-tableless` (the
 historical default-config answer), then `inputs-verdict match|differs|incomplete`, exiting `0`, `6`
-or `7`. `incomplete` means the compiler asked for something the sidecar does not hold.
+or `7`. `incomplete` means the compiler asked for something the sidecar does not hold,
+or the live/replayed terminal refusal was not recorded. An empty unrecorded reason never proves a
+match. The counter belongs to the stage and code hash, so relocating a program or reusing a shader
+address cannot move observations to another program. It distinguishes all recorded config and
+resource metadata; buffer contents and host pointer values deliberately remain outside this
+bounded descriptor-level counter. Repeats use owner-local counting; saturation stops input hashing.
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 

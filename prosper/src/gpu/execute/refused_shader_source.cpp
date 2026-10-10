@@ -62,24 +62,27 @@ void note_refused_compute_program(const std::shared_ptr<const ComputeProgramFact
                                   uint64_t address, uint32_t groups_x, uint32_t groups_y,
                                   uint32_t groups_z, const ShaderResourceTable* table,
                                   const ComputeShaderConfig* config) {
-    if (!facts) return;
+    if (!facts || refused_shader_dump_full()) return;
     const RefusedShaderSource source{{facts, &facts->code}, &facts->refused_shader_memo};
     if (!config) {
         note_refused_compute_shader(address, source, groups_x, groups_y, groups_z);
         return;
     }
-    const uint64_t identity = refused_compute_inputs_identity(table, *config);
-    if (refused_shader_already_noted("cs", source)) {
-        note_refused_shader_input_set("cs", address, identity);
-        return;
-    }
-    const RefusedShaderInputSet inputs{identity, [&](const std::string& stem) {
-                                           return write_refused_compute_inputs(
-                                               stem + ".inputs", address, table, *config,
-                                               last_terminal_reject_reason(address));
-                                       }};
-    if (!note_refused_compute_shader(address, source, groups_x, groups_y, groups_z, &inputs))
-        note_refused_shader_input_set("cs", address, identity);
+    struct Context {
+        uint64_t address;
+        const ShaderResourceTable* table;
+        const ComputeShaderConfig* config;
+    };
+    const Context context{address, table, config};
+    // Synchronous callbacks carry one pointer, including on a repeated/saturated observation.
+    const RefusedShaderInputSet inputs{
+        0,
+        [c = &context](const std::string& stem) {
+            return write_refused_compute_inputs(stem + ".inputs", c->address, c->table, *c->config,
+                                                last_terminal_reject_reason(c->address));
+        },
+        [c = &context] { return refused_compute_inputs_identity(c->table, *c->config); }};
+    note_refused_compute_shader(address, source, groups_x, groups_y, groups_z, &inputs);
 }
 
 namespace {

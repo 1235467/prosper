@@ -253,15 +253,28 @@ TEST(RefusedShaderInputs, TablelessFallbackDiffers) {
     EXPECT_NE(without.reject.find(" pc=6 "), std::string::npos) << without.reject;
 }
 
+namespace {
+size_t only_input_set_count() {
+    const auto dir = refused_shader_dump_directory();
+    if (dir.empty()) return 0;
+    const auto file = only_file(dir, ".input_sets");
+    if (file.empty()) return 0;
+    std::ifstream f(file);
+    std::string line;
+    if (!std::getline(f, line)) return 0;
+    return std::stoull(line.substr(std::strlen("distinct_input_sets=")));
+}
+}   // namespace
+
 TEST(RefusedShaderInputs, LaterInputSetsAreCounted) {
     fresh_root("refused_inputs_count");
     const auto code = fixture_code();
     refuse_live(code, 0x7000, live_inputs(7));
-    EXPECT_EQ(refused_shader_input_sets("cs", 0x7000), 1u);
+    EXPECT_EQ(only_input_set_count(), 1u);
     refuse_live(code, 0x7000, live_inputs(7));
-    EXPECT_EQ(refused_shader_input_sets("cs", 0x7000), 1u) << "a repeat is not a new set";
+    EXPECT_EQ(only_input_set_count(), 1u) << "a repeat is not a new set";
     refuse_live(code, 0x7000, live_inputs(9));
-    EXPECT_EQ(refused_shader_input_sets("cs", 0x7000), 2u);
+    EXPECT_EQ(only_input_set_count(), 2u);
     const fs::path dir = refused_shader_dump_directory();
     const fs::path bin = only_file(dir, ".bin");
     fs::path counter = bin;
@@ -283,7 +296,7 @@ TEST(RefusedShaderInputs, DumpWithoutInputsStillWorks) {
     const fs::path bin = only_file(dir, ".bin");
     ASSERT_FALSE(bin.empty());
     EXPECT_FALSE(fs::exists(refused_shader_inputs_path(bin)));
-    EXPECT_EQ(refused_shader_input_sets("cs", 0x8000), 0u);
+    EXPECT_EQ(only_input_set_count(), 0u);
     std::ifstream index(dir / "index.txt");
     const std::string text{std::istreambuf_iterator<char>(index), {}};
     EXPECT_EQ(text.find(" inputs="), std::string::npos);
@@ -307,4 +320,160 @@ TEST(RefusedShaderInputs, CorruptSidecarIsRefused) {
     auto truncated = bytes;
     truncated.resize(truncated.size() / 2);
     EXPECT_THROW(decode_refused_shader_inputs(truncated), std::runtime_error);
+}
+
+// #4873 review regressions: metadata identity must cover the actual compile inputs,
+// while buffer contents/host addresses deliberately remain outside this counter.
+TEST(RefusedShaderInputs, IdentityIncludesCompilerChoicesAndCompleteDescriptors) {
+    const auto in = live_inputs();
+    const auto base = refused_compute_inputs_identity(&in.table, in.config);
+    const auto config_change = [&](auto change) {
+        auto config = in.config;
+        change(config);
+        EXPECT_NE(refused_compute_inputs_identity(&in.table, config), base);
+    };
+    config_change([](auto& c) { c.wave64_exchange_width = 32; });
+    config_change([](auto& c) { c.force_exchange_dispatcher = true; });
+    config_change([](auto& c) { c.native_storage_format_support = 1; });
+    config_change([](auto& c) { c.storage_buffer_int64_atomics = true; });
+    config_change([](auto& c) { c.packed_r11_storage = false; });
+    config_change(
+        [](auto& c) { c.float_transport.profile = FloatTransportProfile::ExplicitNonFinite32; });
+    const auto resource_change = [&](auto change) {
+        auto table = in.table;
+        change(table.resources[0]);
+        EXPECT_NE(refused_compute_inputs_identity(&table, in.config), base);
+    };
+    resource_change([](auto& r) { ++r.binding; });
+    resource_change([](auto& r) { --r.num_components; });
+    resource_change([](auto& r) { ++r.depth; });
+    resource_change([](auto& r) { r.depth_compare = true; });
+    resource_change([](auto& r) { r.swizzle[0] = 5; });
+    resource_change([](auto& r) { r.owned_raw_snapshot_bytes = 16; });
+    resource_change([](auto& r) { r.owned_nested_snapshot_bytes = 32; });
+    resource_change([](auto& r) { r.table_index_count = 2; });
+    auto table = in.table;
+    table.resources[0].table_entries.resize(1);
+    const auto entry_base = refused_compute_inputs_identity(&table, in.config);
+    table.resources[0].table_entries[0].vsharp[2] = 123;
+    EXPECT_NE(refused_compute_inputs_identity(&table, in.config), entry_base);
+    const ShaderResourceTable empty;
+    EXPECT_NE(refused_compute_inputs_identity(nullptr, in.config),
+              refused_compute_inputs_identity(&empty, in.config));
+    // Mutating bytes with otherwise equal metadata must not count another descriptor set.
+    uint8_t first = 1, second = 2;
+    auto a = in.table, b = in.table;
+    a.resources[0].host_data = &first;
+    b.resources[0].host_data = &second;
+    a.resources[0].host_data_size = b.resources[0].host_data_size = 1;
+    EXPECT_EQ(refused_compute_inputs_identity(&a, in.config),
+              refused_compute_inputs_identity(&b, in.config));
+}
+
+TEST(RefusedShaderInputs, FailedRenameReportsFailureAndKeepsDestination) {
+    const auto root = fresh_root("refused_inputs_rename_failure");
+    const auto in = live_inputs();
+    const auto destination = root / "directory.inputs";
+    ASSERT_TRUE(fs::create_directory(destination));
+    EXPECT_FALSE(write_refused_compute_inputs(destination, 0x42, &in.table, in.config, "r"));
+    EXPECT_TRUE(fs::is_directory(destination));
+    EXPECT_FALSE(fs::exists(destination.string() + ".partial"));
+    EXPECT_TRUE(
+        write_refused_compute_inputs(root / "valid.inputs", 0x42, &in.table, in.config, "r"));
+}
+
+TEST(RefusedShaderInputs, ReplayWithoutRecordedRefusalIsIncomplete) {
+    RefusedShaderInputs inputs;
+    inputs.stage = "cs";
+    EXPECT_FALSE(replay_refused_shader_inputs({0xbf810000u}, inputs).incomplete.empty());
+    // A recorded refusal remains eligible for a meaningful comparison.
+    inputs.live_reject = "known terminal refusal";
+    inputs.compute.force_exchange_dispatcher = true;
+    inputs.compute.wave_size = 32;
+    EXPECT_FALSE(replay_refused_shader_inputs({0xbf810000u}, inputs).incomplete.empty())
+        << "an empty module without a terminal reject is unavailable evidence";
+}
+
+TEST(RefusedShaderInputs, CounterFollowsCodeAcrossAddressReuseAndRelocation) {
+    fresh_root("refused_inputs_code_counter");
+    const auto first = fixture_code();
+    auto second = first;
+    second[2] = 0x7e000208u;
+    refuse_live(first, 0x9000, live_inputs(7));
+    refuse_live(second, 0x9000, live_inputs(11));
+    refuse_live(first, 0x9000, live_inputs(9));
+    refuse_live(first, 0xa000, live_inputs(13));
+    size_t checked = 0;
+    for (const auto& file : fs::directory_iterator(refused_shader_dump_directory())) {
+        if (file.path().extension() != ".bin") continue;
+        const auto words = read_words(file.path());
+        auto counter = file.path();
+        counter.replace_extension(".input_sets");
+        std::ifstream f(counter);
+        std::string line;
+        ASSERT_TRUE(std::getline(f, line));
+        EXPECT_EQ(line, words == first ? "distinct_input_sets=3" : "distinct_input_sets=1");
+        ++checked;
+    }
+    EXPECT_EQ(checked, 2u);
+}
+
+TEST(RefusedShaderInputs, WarmCountersAvoidGlobalLockAndSaturationStopsHashing) {
+    fresh_root("refused_inputs_warm_counter");
+    const auto code = fixture_code();
+    auto in = live_inputs();
+    refuse_live(code, 0xb000, in);
+    const auto facts = compute_program_facts(code.data(), code.size(),
+                                             {RecompileDiagnosticStage::Compute, 0xb000});
+    const auto cold = refused_shader_dump_stats();
+    for (unsigned i = 0; i != 128; ++i)
+        note_refused_compute_program(facts, 0xb000, 4, 1, 1, &in.table, &in.config);
+    const auto warm = refused_shader_dump_stats();
+    EXPECT_EQ(warm.input_set_global_locks, cold.input_set_global_locks);
+    EXPECT_EQ(warm.hash_evaluations, cold.hash_evaluations);
+    EXPECT_EQ(only_input_set_count(), 1u);
+    // Changing metadata still counts: no pointer-identity shortcut may hide these dispatches.
+    for (unsigned i = 0; i != kRefusedShaderMaxInputSetsCounted; ++i) {
+        in.config.user_sgprs[4] = i;
+        note_refused_compute_program(facts, 0xb000, 4, 1, 1, &in.table, &in.config);
+    }
+    EXPECT_EQ(only_input_set_count(), kRefusedShaderMaxInputSetsCounted);
+    const auto saturated = refused_shader_dump_stats();
+    in.config.user_sgprs[4] = 1024;
+    for (unsigned i = 0; i != 128; ++i)
+        note_refused_compute_program(facts, 0xb000, 4, 1, 1, &in.table, &in.config);
+    const auto after = refused_shader_dump_stats();
+    EXPECT_EQ(after.input_set_global_locks, saturated.input_set_global_locks);
+    EXPECT_EQ(after.input_identity_evaluations, saturated.input_identity_evaluations);
+    EXPECT_EQ(after.hash_evaluations, saturated.hash_evaluations);
+    const auto count = only_file(refused_shader_dump_directory(), ".input_sets");
+    std::ifstream f(count);
+    std::string line;
+    ASSERT_TRUE(std::getline(f, line));
+    EXPECT_EQ(line, "distinct_input_sets=256+");
+}
+
+TEST(RefusedShaderInputs, MissingSidecarAndFullBudgetStopInputWork) {
+    fresh_root("refused_inputs_no_counter");
+    const auto code = fixture_code();
+    auto in = live_inputs();
+    refuse_live(code, 0xc000, in, false);
+    const auto facts = compute_program_facts(code.data(), code.size(),
+                                             {RecompileDiagnosticStage::Compute, 0xc000});
+    const auto before = refused_shader_dump_stats();
+    note_refused_compute_program(facts, 0xc000, 4, 1, 1, &in.table, &in.config);
+    EXPECT_EQ(refused_shader_dump_stats().input_identity_evaluations,
+              before.input_identity_evaluations);
+    EXPECT_EQ(refused_shader_dump_stats().input_set_global_locks, before.input_set_global_locks);
+    EXPECT_EQ(only_input_set_count(), 0u);
+    for (unsigned i = 0; i != kRefusedShaderDumpMaxPrograms; ++i) {
+        const uint32_t words[] = {0xbe800300u + i, 0xbf810000u};
+        note_refused_shader("cs", 0xd000 + i, words, 2, "");
+    }
+    ASSERT_TRUE(refused_shader_dump_full());
+    const auto full = refused_shader_dump_stats();
+    note_refused_compute_program(facts, 0xc000, 4, 1, 1, &in.table, &in.config);
+    EXPECT_EQ(refused_shader_dump_stats().input_identity_evaluations,
+              full.input_identity_evaluations);
+    EXPECT_EQ(refused_shader_dump_stats().input_set_global_locks, full.input_set_global_locks);
 }
