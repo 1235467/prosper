@@ -3254,8 +3254,8 @@ inline bool sreg_word_may_be_fabricated(const RegState& rs, int r) {
 // Whether a source of a Wave64 B32 write into a VCC word is defined on every path, by #4706's
 // per-word marks rather than the whole-path `scalar_presence_has_no_placeholders`, which ANY
 // structured if clears even when the instruction reads none of the registers it merged (#4846).
-// emit_alu accepts it only where the whole-CFG proof shows the write low-only, so the result is
-// scalar data and SCC=(result!=0) is defined; nothing is projected into lane bits. PPSA28000
+// emit_alu accepts it for a low-only write or a complete, definite scalar pair. SCC must itself be
+// defined when read explicitly as a 0/1 dword. PPSA28000
 // 0x26005ba000 and PPSA29343 0x4580fe3400 run `s_and_b32 vcc_lo, vcc_lo, 12` straight after an if
 // that wrote only s[14:15], then `s_cselect_b32 vcc_lo, 4, 5` on that SCC. A marked, absent or
 // fabricated word (and every mask operand) is still refused.
@@ -3268,6 +3268,7 @@ inline bool b32_source_word_defined(const RegState& rs, const Operand& source) {
             return (rs.sreg.contains(source.value) || rs.sreg_input.contains(source.value)) &&
                    !sreg_word_may_be_fabricated(rs, source.value);
         case OperandKind::Special:
+            if (source.value == 253) return rs.scc != 0 && !rs.scc_merge_placeholder;
             return source.value >= 106 && source.value <= 124 && rs.sreg.contains(source.value) &&
                    !rs.sreg_merge_placeholder.contains(source.value);
         default: return false;
@@ -3856,11 +3857,17 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                 rs.sreg_memory_pattern.erase(r);
         }
     });
-    // SCC: a marked input marks it. Only a compare is certain to rewrite it, so only a compare from
-    // definite inputs clears it (other scalar writers may leave it, which keeps the mark: safe).
+    // SCC: a marked input marks an operation which may rewrite it. Only a compare from definite
+    // inputs clears it here; other scalar writers retain the old mark conservatively.
     const bool scalar_alu = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                             in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC;
-    if (scalar_alu && marks.placeholder)
+    // S_MOV_B32/B64 copy marked numeric data without writing SCC. Keep the destination's marks
+    // above, but neither poison nor refresh the prior condition. CONFIDENCE: HIGH -- RDNA2 70648
+    // section 12.3 gives only the destination assignment for these moves, unlike SCC writers.
+    const bool move_preserves_scc =
+        in.fmt == Rdna2Format::SOP1 &&
+        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
+    if (scalar_alu && marks.placeholder && !move_preserves_scc)
         rs.scc_merge_placeholder = true;
     else if (in.fmt == Rdna2Format::SOPC)
         rs.scc_merge_placeholder = false;

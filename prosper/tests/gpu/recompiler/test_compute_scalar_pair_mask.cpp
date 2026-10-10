@@ -876,3 +876,100 @@ TEST(ScalarPairMask, Wave64VccLoAndReadingAOnePathWordStillRefuses) {
     EXPECT_TRUE(compile_vcc_as_data(Stage::Compute, one_path_sgpr).empty())
         << "a one-path s14 is the structured emitter's fabricated zero";
 }
+
+// #4846: a structured if can create placeholders in unrelated words, while fresh compares and
+// selects still define SCC and both VCC data words. The logical write must consume those exact
+// words, preserve its untouched sibling, and publish the resulting lane mask.
+TEST(ScalarPairMask, Wave64VccLogicalReadingFreshSccAfterAnUnrelatedMergeCompiles) {
+    // s_mov vcc_lo,7 | s_cmp_lg_u32 vcc_lo,3 | s_cselect_b32 vcc_hi,1,0 |
+    // s_cmp_lg_u32 vcc_lo,0 | s_and_b32 vcc_lo,scc,vcc_hi
+    const Words fresh_pair = {0xbeea0387u, 0xbf07836au, 0x856b8081u, 0xbf07806au};
+    for (uint32_t logical : {0x876a6bfdu, 0x876afd6bu, 0x876b6afdu, 0x876bfd6au}) {
+        const Words write = {logical};
+        const Words body = cat({&kPrefix, &kOnePath, &fresh_pair, &write});
+        EXPECT_FALSE(compile(Stage::Compute, body).empty())
+            << "fresh SCC and both VCC words are defined for either destination and operand order: "
+            << last_terminal_reject_reason(kAddress);
+    }
+}
+
+TEST(ScalarPairMask, Wave64VccLogicalReadingAOnePathSiblingStillRefuses) {
+    // VCC_HI is written on one arm only, then the compare refreshes SCC unconditionally.
+    const Words one_path_hi = {0xbeea0387u, 0xbf068000u, 0xbf850001u,
+                               0xbeeb0385u, 0xbf07806au, 0x876a6bfdu};
+    const Words body = cat({&kPrefix, &one_path_hi});
+    EXPECT_TRUE(compile(Stage::Compute, body).empty())
+        << "a fabricated VCC_HI cannot become the untouched high half of a lane mask";
+    EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+              std::string::npos);
+}
+
+TEST(ScalarPairMask, Wave64VccLogicalReadingAnUnrefreshedSccJoinStillRefuses) {
+    // One arm writes a B64 mask logical, whose whole-wave SCC is unavailable in this emitter.
+    // The subsequent scalar moves define the pair but preserve the merged/poisoned SCC.
+    const Words poisoned_scc = {0xbf068000u, 0xbf850001u, 0x8784c102u,
+                                0xbeea0387u, 0xbeeb0385u, 0x876a6bfdu};
+    const Words body = cat({&kPrefix, &poisoned_scc});
+    EXPECT_TRUE(compile(Stage::Compute, body).empty())
+        << "a dispatcher or structured join's SCC placeholder is not scalar 0/1 input";
+    EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+              std::string::npos);
+}
+
+TEST(ScalarPairMask, Wave64VccLogicalReadingAMaskOnlySiblingStillRefuses) {
+    // A VOPC result replaces both data words with a mask. The scalar compare refreshes SCC but
+    // cannot make VCC_HI a scalar dword for this cross-half logical operation.
+    const Words mask_only_hi = {0x7d840080u, 0xbf068000u, 0x876a6bfdu};
+    const Words body = cat({&kPrefix, &kOnePath, &mask_only_hi});
+    EXPECT_TRUE(compile(Stage::Compute, body).empty())
+        << "a mask-only VCC_HI is not complete scalar sibling data";
+    EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+              std::string::npos);
+}
+
+// A fabricated source marks MOV's numeric destination, but MOV cannot replace the genuine SCC
+// consumed by the following select. Pin B32 and B64 independently of the per-word logical proof.
+TEST(ScalarPairMask, Wave64VccLogicalReadingSccPreservedByAMarkedMoveCompiles) {
+    const Words fresh_compare = {0xbeea0387u, 0xbf07836au};
+    const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6bfdu};
+    for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
+        const Words marked_move = {move};
+        const Words body =
+            cat({&kPrefix, &kOnePath, &fresh_compare, &marked_move, &select_and_logical});
+        EXPECT_FALSE(compile(Stage::Compute, body).empty())
+            << "S_MOV_B32/B64 preserve the compare's SCC despite their marked data source: "
+            << last_terminal_reject_reason(kAddress);
+    }
+}
+
+TEST(ScalarPairMask, Wave64VccLogicalReadingAMarkedMoveResultStillRefuses) {
+    const Words fresh_compare = {0xbeea0387u, 0xbf07836au};
+    // The logical reads the move's marked s2 rather than SCC, so numeric authority stays absent.
+    const Words select_and_logical = {0x856b8081u, 0xbf07806au, 0x876a6b02u};
+    for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
+        const Words marked_move = {move};
+        const Words body =
+            cat({&kPrefix, &kOnePath, &fresh_compare, &marked_move, &select_and_logical});
+        EXPECT_TRUE(compile(Stage::Compute, body).empty())
+            << "preserving SCC does not define a one-path MOV source or its numeric destination";
+        EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+                  std::string::npos);
+        EXPECT_NE(last_terminal_reject_reason(kAddress).find("pc=14 words=d5010003"),
+                  std::string::npos)
+            << "refusal must be the first mask consumer of marked MOV data: "
+            << last_terminal_reject_reason(kAddress);
+    }
+}
+
+TEST(ScalarPairMask, Wave64VccLogicalReadingSccFromMarkedArithmeticStillRefuses) {
+    const Words fresh_compare = {0xbeea0387u, 0xbf07836au};
+    // s_add_u32 s2,s4,0 writes SCC from the one-path s4; it is not an SCC-preserving move.
+    const Words marked_add_and_select = {0x80028004u, 0x856b8081u, 0xbf07806au, 0x876a6bfdu};
+    const Words body = cat({&kPrefix, &kOnePath, &fresh_compare, &marked_add_and_select});
+    EXPECT_TRUE(compile(Stage::Compute, body).empty())
+        << "the later compare refreshes SCC only; HI still depends on marked arithmetic SCC";
+    EXPECT_NE(last_terminal_reject_reason(kAddress).find("mode=unresolved-operand"),
+              std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(kAddress).find("pc=13 words=876a6bfd"), std::string::npos)
+        << "refusal must be the logical using marked arithmetic SCC";
+}

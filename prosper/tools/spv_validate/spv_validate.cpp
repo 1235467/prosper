@@ -1637,6 +1637,41 @@ int main(int argc, char** argv) {
     // Compute mul_hi (high 32 bits via OpUMulExtended -> {lo,hi} struct extract).
     { const uint32_t c[] = {0x7E0202FFu,0x80000000u,0xD56A0002u,0x00020301u,0x7E000D02u,0xBF810000u};
       dump(dir, "compute_mul_hi", recompile_valu(c, sizeof(c)/4, 1, 0)); }
+    // #4846: an unrelated structured merge does not invalidate freshly defined SCC/VCC data.
+    // Both B32 destinations and operand orders must reconstruct the complete scalar pair.
+    {
+        uint32_t c[] = {0x7e0a0280u, 0x7e000505u, 0xd4c20002u, 0x00010080u, 0xbf068000u,
+                        0xbf850002u, 0xbe8403c1u, 0xbe8503c1u, 0xbeea0387u, 0xbf07836au,
+                        0x856b8081u, 0xbf07806au, 0x876a6bfdu, 0xd5010003u, 0x01a9e480u,
+                        0xe0702000u, 0x80020300u, 0xbf810000u};
+        ShaderResourceTable rt;
+        ShaderResource output{};
+        output.cls = ResourceClass::ConstantBuffer;
+        output.format = DataFormat::Uint32;
+        output.num_components = 1;
+        output.binding = 3;
+        output.stride = 4;
+        output.sgpr_base = 8;
+        rt.resources.push_back(output);
+        ComputeShaderConfig cfg;
+        cfg.local_x = 64;
+        cfg.wave_size = 64;
+        cfg.native_subgroup_size = 64;
+        for (uint32_t logical : {0x876a6bfdu, 0x876afd6bu, 0x876b6afdu, 0x876bfd6au}) {
+            c[12] = logical;
+            const std::string name =
+                "compute_vcc_scalar_pair_after_merge_" + std::to_string(logical);
+            dump(dir, name.c_str(), recompile_compute(c, std::size(c), &rt, cfg));
+        }
+        c[12] = 0x876a6bfdu;
+        for (uint32_t move : {0xbe820304u, 0xbe820404u}) {
+            std::vector<uint32_t> marked_move(std::begin(c), std::end(c));
+            marked_move.insert(marked_move.begin() + 10, move);
+            const std::string name = "compute_vcc_pair_scc_preserving_move_" + std::to_string(move);
+            dump(dir, name.c_str(),
+                 recompile_compute(marked_move.data(), marked_move.size(), &rt, cfg));
+        }
+    }
     // Compute: saved VOPC mask combined with VCC by s_nor_b64 (UE4 visibility-mask shape).
     { const uint32_t c[] = {0x7C040CF9u,0x06869880u,0x8DEA6A18u,0xBF810000u};
       dump(dir, "compute_mask_nor", recompile_valu(c, sizeof(c)/4, 0, 0)); }
