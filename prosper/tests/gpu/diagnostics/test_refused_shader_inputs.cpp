@@ -208,7 +208,7 @@ TEST(RefusedShaderInputs, PayloadAboveCapIsOmitted) {
 }
 
 TEST(RefusedShaderInputs, ReplayReproducesLiveRefusal) {
-    const fs::path root = fresh_root("refused_inputs_replay");
+    fresh_root("refused_inputs_replay");  // resets the dump and facts state; the path is unused
     const auto code = fixture_code();
     const LiveInputs in = live_inputs();
     const std::string live = refuse_live(code, 0x5000, in);

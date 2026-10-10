@@ -34,7 +34,7 @@ namespace prosper::gpu {
 
 // Guest buffer bytes kept per sidecar. Above it the table is still recorded in full, but buffer
 // contents become opaque and a replay that needs them reports INCOMPLETE.
-inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256 * 1024;
+inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256ull * 1024ull;
 inline constexpr uint32_t kRefusedShaderInputsSchema = 1;
 
 struct RefusedShaderInputs {
