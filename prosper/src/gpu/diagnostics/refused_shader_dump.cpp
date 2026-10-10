@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <mutex>
 #include <atomic>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -24,6 +25,12 @@ struct DumpState {
     std::string root;            // empty: derive from PROSPER_CAPTURE_DIR on first use
     std::string directory;       // created lazily on the first refusal
     std::set<std::pair<std::string, uint64_t>> seen;   // (stage, code hash)
+    struct InputSets {
+        std::string stem;
+        std::set<uint64_t> identities;
+    };
+    // Programs dumped with a sidecar, by (stage, address): bounded by the program budgets above.
+    std::map<std::pair<std::string, uint64_t>, InputSets> input_sets;
     bool dir_failure_announced = false;
     size_t refusal_count = 0;   // distinct programs recorded under each budget
     size_t declined_count = 0;
@@ -93,6 +100,15 @@ std::string make_directory(DumpState& s) {
     return s.directory;
 }
 
+void write_input_set_count(const DumpState::InputSets& sets) {
+    const std::string path = sets.stem + ".input_sets";
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fprintf(f, "distinct_input_sets=%zu%s\n", sets.identities.size(),
+                     sets.identities.size() >= kRefusedShaderMaxInputSetsCounted ? "+" : "");
+        std::fclose(f);
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -103,7 +119,8 @@ bool budget_full(RefusedShaderBudget budget) {
 }   // namespace
 
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
-                         const std::string& detail, RefusedShaderBudget budget) {
+                         const std::string& detail, RefusedShaderBudget budget,
+                         const RefusedShaderInputSet* inputs) {
     if (budget_full(budget)) return false;
     if (!stage || !code || !dwords) return false;
     const uint64_t hash = hash_code(code, dwords);
@@ -135,6 +152,20 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
         written = std::fwrite(code, sizeof(uint32_t), dwords, f) == dwords;
         written = (std::fclose(f) == 0) && written;
     }
+    // The live compile inputs (#4808), beside the program and only for a newly written one.
+    std::string inputs_field;
+    if (written && inputs && inputs->write) {
+        std::string stem = path.string();
+        stem.resize(stem.size() - 4);   // ".bin"
+        if (inputs->write(stem)) {
+            auto& sets = s.input_sets[{stage, address}];
+            sets.stem = stem;
+            sets.identities = {inputs->identity};
+            write_input_set_count(sets);
+            inputs_field = std::string(" inputs=") +
+                           std::filesystem::path(stem).filename().string() + ".inputs";
+        }
+    }
     const RecompileCoverage coverage = recompile_coverage(code, dwords);
     // The recompiler's own last terminal reject for this program, when it recorded one. The
     // coverage census above is compute-safe and stage-agnostic, so on a graphics program it often
@@ -148,11 +179,11 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
     if (FILE* index = std::fopen((std::filesystem::path(dir) / "index.txt").string().c_str(), "a")) {
         std::fprintf(index,
                      "%s addr=0x%llx dwords=%zu hash=%016llx first_bad_fmt=%d "
-                     "first_bad_op=0x%x unsupported=%u file=%s %s%s%s%s\n",
+                     "first_bad_op=0x%x unsupported=%u file=%s %s%s%s%s%s\n",
                      stage, (unsigned long long)address, dwords, (unsigned long long)hash,
                      coverage.first_bad_fmt, coverage.first_bad_op, coverage.unsupported, file,
-                     detail.c_str(), reject.empty() ? "" : " reject=\"", reject.c_str(),
-                     reject.empty() ? "" : "\"");
+                     detail.c_str(), inputs_field.c_str(), reject.empty() ? "" : " reject=\"",
+                     reject.c_str(), reject.empty() ? "" : "\"");
         std::fclose(index);
     }
     // A draw a gate refused was never recompiled, so its "first unsupported" instruction is only
@@ -175,7 +206,8 @@ bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* co
 }
 
 bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
-                         const std::string& detail, RefusedShaderBudget budget) {
+                         const std::string& detail, RefusedShaderBudget budget,
+                         const RefusedShaderInputSet* inputs) {
     if (budget_full(budget) || !stage || !source.words || source.words->empty()) return false;
     const uint64_t bit = stage_bit(stage);
     if (source.memo && bit) {
@@ -191,7 +223,7 @@ bool note_refused_shader(const char* stage, uint64_t address, const RefusedShade
         }
     }
     return note_refused_shader(stage, address, source.words->data(), source.words->size(), detail,
-                               budget);
+                               budget, inputs);
 }
 
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source) {
@@ -203,11 +235,31 @@ bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& 
 }
 
 bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
-                                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
+                                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+                                 const RefusedShaderInputSet* inputs) {
     if (refused_shader_already_noted("cs", source)) return false;
     char detail[96];
     std::snprintf(detail, sizeof detail, "dispatch groups=%ux%ux%u", groups_x, groups_y, groups_z);
-    return note_refused_shader("cs", address, source, detail);
+    return note_refused_shader("cs", address, source, detail, RefusedShaderBudget::Refusal, inputs);
+}
+
+void note_refused_shader_input_set(const char* stage, uint64_t address, uint64_t identity) {
+    if (!stage) return;
+    DumpState& s = state();
+    std::lock_guard lock(s.mutex);
+    const auto found = s.input_sets.find({stage, address});
+    if (found == s.input_sets.end()) return;
+    auto& sets = found->second;
+    if (sets.identities.size() >= kRefusedShaderMaxInputSetsCounted) return;
+    if (sets.identities.insert(identity).second) write_input_set_count(sets);
+}
+
+size_t refused_shader_input_sets(const char* stage, uint64_t address) {
+    if (!stage) return 0;
+    DumpState& s = state();
+    std::lock_guard lock(s.mutex);
+    const auto found = s.input_sets.find({stage, address});
+    return found == s.input_sets.end() ? 0 : found->second.identities.size();
 }
 
 bool refused_shader_dump_full() {
@@ -243,6 +295,7 @@ void reset_refused_shader_dump_for_test(const std::string& root) {
     s.root = root;
     s.directory.clear();
     s.seen.clear();
+    s.input_sets.clear();
     s.full.store(false);
     s.declined_full.store(false);
     s.refusal_count = 0;

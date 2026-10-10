@@ -1,4 +1,5 @@
 // shader_inspect - print the decoded RDNA2 stream and resolved control-flow targets from a raw dump.
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <ios>
 #include <iterator>
@@ -209,6 +211,72 @@ ShaderResourceTable synthetic_resource_table(const std::vector<Rdna2Inst>& instr
     return table;
 }
 
+// Strips the characters the dump's index line strips, so the two answers compare as text.
+std::string printable(std::string text) {
+    for (char& c : text)
+        if (c == '\n' || c == '\r' || c == '"') c = ' ';
+    return text;
+}
+
+// --inputs: the live decision, reproduced from the dump's own sidecar (#4808). Prints three
+// answers -- what the live recompile said, what a replay on the recorded inputs says, and what the
+// historical table-less recompile says -- so a disagreement between the last two is visible as the
+// thing the sidecar fixed, and one between the first two as a replay gap to investigate.
+int replay_recorded_inputs(const std::string& code_path, const std::string& inputs_path,
+                           const std::vector<uint32_t>& words) {
+    RefusedShaderInputs inputs;
+    try {
+        inputs = read_refused_shader_inputs(inputs_path);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "shader_inspect: %s: %s\n", inputs_path.c_str(), e.what());
+        return 2;
+    }
+    if (inputs.stage != "cs") {
+        std::fprintf(stderr, "shader_inspect: %s records stage %s; only cs replays\n",
+                     inputs_path.c_str(), inputs.stage.c_str());
+        return 2;
+    }
+    std::string sets = "unrecorded";
+    {
+        std::filesystem::path counter = inputs_path;
+        counter.replace_extension(".input_sets");
+        std::ifstream in(counter);
+        std::string line;
+        if (in && std::getline(in, line) && line.rfind("distinct_input_sets=", 0) == 0)
+            sets = line.substr(std::strlen("distinct_input_sets="));
+    }
+    std::printf("inputs file=%s code=%s address=0x%llx user_sgprs=%zu wave=%u local=%ux%ux%u "
+                "resources=%zu payload=%s input_sets=%s%s%s\n",
+                inputs_path.c_str(), code_path.c_str(),
+                static_cast<unsigned long long>(inputs.program_address),
+                inputs.compute.user_sgprs.size(), inputs.compute.wave_size, inputs.compute.local_x,
+                inputs.compute.local_y, inputs.compute.local_z, inputs.resources.resources.size(),
+                inputs.payload_omitted ? "omitted" : "kept", sets.c_str(),
+                inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
+    const auto line = [](const char* label, const RefusedShaderReplay& r) {
+        const char* status = !r.incomplete.empty() ? "incomplete" : r.produced ? "ok" : "rejected";
+        std::printf("%s status=%s reject=\"%s\"%s%s\n", label, status, printable(r.reject).c_str(),
+                    r.incomplete.empty() ? "" : " why=", printable(r.incomplete).c_str());
+    };
+    std::printf("inputs-live status=%s reject=\"%s\"\n",
+                inputs.live_reject.empty() ? "unrecorded" : "rejected",
+                printable(inputs.live_reject).c_str());
+    const RefusedShaderReplay replay = replay_refused_shader_inputs(words, inputs, true);
+    const RefusedShaderReplay fallback = replay_refused_shader_inputs(words, inputs, false);
+    line("inputs-replay", replay);
+    line("inputs-tableless", fallback);
+    const bool incomplete = !replay.incomplete.empty();
+    const bool match = !incomplete && !replay.produced && replay.reject == inputs.live_reject;
+    std::printf("inputs-verdict %s tableless=%s\n",
+                incomplete ? "incomplete"
+                : match    ? "match"
+                           : "differs",
+                (fallback.produced == replay.produced && fallback.reject == replay.reject)
+                    ? "same"
+                    : "differs");
+    return incomplete ? 7 : match ? 0 : 6;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -224,6 +292,7 @@ int main(int argc, char** argv) {
     bool raw_wide_proof = false;
     bool wave64 = false;
     bool synthetic_table = false;
+    std::string inputs_path;
     std::string spirv_out;
     bool bad_usage = false;
     for (int i = 1; i < argc && !bad_usage; ++i) {
@@ -243,6 +312,11 @@ int main(int argc, char** argv) {
             wave64 = true;
         } else if (arg == "--synthetic-table") {
             synthetic_table = true;
+        } else if (arg == "--inputs") {
+            if (i + 1 >= argc)
+                bad_usage = true;
+            else
+                inputs_path = argv[++i];
         } else if (arg == "--spirv-out") {
             if (i + 1 >= argc)
                 bad_usage = true;
@@ -263,11 +337,16 @@ int main(int argc, char** argv) {
         (synthetic_table && stage != "vertex" && stage != "fragment") ||
         (!spirv_out.empty() && !synthetic_table) ||
         (skippable_mimg && (!stage.empty() || mimg_sites || wave_reasons || raw_wide_proof)) ||
+        (!inputs_path.empty() &&
+         ((!stage.empty() && stage != "compute") || mimg_sites || skippable_mimg || wave_reasons ||
+          raw_wide_proof || synthetic_table)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr,
                      "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table "
                      "[--spirv-out FILE]\n",
+                     argv[0]);
+        std::fprintf(stderr, "       %s <cs_*.bin> --inputs <cs_*.inputs> [--stage compute]\n",
                      argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
@@ -319,8 +398,14 @@ int main(int argc, char** argv) {
             "that nothing outside descriptor resolution refuses the program, never that it is\n"
             "admitted live. It reports status=ok-synthetic-table / rejected-synthetic-table.\n"
             "\n"
+            "--inputs replays a refused compute program with the live inputs the refused-shader\n"
+            "dump recorded beside it (#4808): the launch config and user-data SGPRs, the resolved\n"
+            "descriptor table, and the buffer bytes the compiler may read. It prints the live\n"
+            "reject, the replayed reject, and the table-less answer for comparison.\n"
+            "\n"
             "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource "
-            "table), 4 synthetic-table compile passed, 5 synthetic-table compile refused.\n");
+            "table), 4 synthetic-table compile passed, 5 synthetic-table compile refused,\n"
+            "6 --inputs replay differs from the live answer, 7 --inputs replay incomplete.\n");
         return 2;
     }
 
@@ -349,6 +434,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
     std::memcpy(words.data(), bytes.data(), bytes.size());
+    if (!inputs_path.empty()) return replay_recorded_inputs(input_path, inputs_path, words);
     std::vector<Rdna2Inst> instructions;
     const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
 

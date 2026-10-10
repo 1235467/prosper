@@ -380,6 +380,19 @@ shader), `2` usage/IO error, `3` undetermined because no resource table could be
 deliberately non-zero — a table-less run is never reported as a pass. Synthetic probes exit `4`
 when compilation succeeds and `5` when the translator refuses, keeping both results distinct from
 a table-accurate verdict.
+
+A refused **compute** program from the default refused-shader dump has a `<stem>.inputs` sidecar
+beside its `.bin` (#4808): the live launch config, user-data SGPRs, resolved descriptor table and the
+buffer bytes the compiler may read. Replay the live decision with it instead of guessing:
+
+```bash
+./build-linux/shader_inspect refused_shaders_*/cs_<addr>_<hash>.bin \
+    --inputs refused_shaders_*/cs_<addr>_<hash>.inputs
+```
+
+It prints `inputs-live`, `inputs-replay` (on the recorded inputs) and `inputs-tableless` (the
+historical default-config answer), then `inputs-verdict match|differs|incomplete`, exiting `0`, `6`
+or `7`. `incomplete` means the compiler asked for something the sidecar does not hold.
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 

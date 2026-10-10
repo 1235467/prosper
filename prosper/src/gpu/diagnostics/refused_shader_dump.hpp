@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -46,20 +47,38 @@ struct RefusedShaderSource {
     const RefusedShaderMemo* memo = nullptr;   // owned by the same control block as words
 };
 
+// The live inputs a refusal was made with (#4808, refused_shader_inputs.hpp). `write` is called
+// once, beside a NEWLY dumped program, with that program's path minus ".bin", and writes the
+// sidecar there; `identity` names the input set for the per-program distinct-set counter.
+struct RefusedShaderInputSet {
+    uint64_t identity = 0;
+    std::function<bool(const std::string& stem)> write;
+};
+inline constexpr size_t kRefusedShaderMaxInputSetsCounted = 256;
+
 bool note_refused_shader(const char* stage, uint64_t address, const RefusedShaderSource& source,
                          const std::string& detail,
-                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal);
+                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal,
+                         const RefusedShaderInputSet* inputs = nullptr);
 // An owner-version/stage probe, never an address/first-word shortcut. Does not mark an observation.
 bool refused_shader_already_noted(const char* stage, const RefusedShaderSource& source);
 bool note_refused_compute_shader(uint64_t address, const RefusedShaderSource& source,
-                                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+                                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+                                 const RefusedShaderInputSet* inputs = nullptr);
+// A later refusal of a program already dumped WITH a sidecar: counts `identity` into the program's
+// distinct-input-set tally, rewritten to `<stem>.input_sets` when it grows. Only the first set's
+// inputs are kept. Counting stops at kRefusedShaderMaxInputSetsCounted ("256+").
+void note_refused_shader_input_set(const char* stage, uint64_t address, uint64_t identity);
+// The tally above, 0 when the program has no sidecar (a test hook and the replay tool's source).
+size_t refused_shader_input_sets(const char* stage, uint64_t address);
 
 // `stage` is a short tag ("vs", "ps", "cs"); `code` is the guest program, `dwords` its proven-readable
 // length. `detail` is appended to the index line verbatim (sizes, draw order, reject reason).
 // Returns true when this call wrote a new program.
 bool note_refused_shader(const char* stage, uint64_t address, const uint32_t* code, size_t dwords,
                          const std::string& detail,
-                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal);
+                         RefusedShaderBudget budget = RefusedShaderBudget::Refusal,
+                         const RefusedShaderInputSet* inputs = nullptr);
 
 // Stops default diagnostic work, not shader execution/rejection or explicit unbounded dumping.
 bool refused_shader_dump_full();

@@ -8,6 +8,8 @@ namespace prosper::gpu {
 
 struct ShaderCodeAnalysis;
 struct ComputeProgramFacts;
+struct ShaderResourceTable;
+struct ComputeShaderConfig;
 
 // Original stage observations only. These fields confer no compilation or draw admission.
 struct RefusedDrawShaders {
@@ -29,9 +31,12 @@ struct RefusedDrawShaders {
 };
 
 void note_refused_draw_shaders(const RefusedDrawShaders& shaders);
+// With `config`, the first refusal of a program also keeps the live compile inputs beside it
+// (`<stem>.inputs`, refused_shader_inputs.hpp) and later refusals count distinct input sets (#4808).
 void note_refused_compute_program(const std::shared_ptr<const ComputeProgramFacts>& facts,
                                   uint64_t address, uint32_t groups_x, uint32_t groups_y,
-                                  uint32_t groups_z);
+                                  uint32_t groups_z, const ShaderResourceTable* table = nullptr,
+                                  const ComputeShaderConfig* config = nullptr);
 
 // The live compute backend's reason for declining the dispatch it is executing. The backend runs
 // synchronously on the executor's thread, so the executor reads the slot back right after a
