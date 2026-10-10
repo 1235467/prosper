@@ -486,6 +486,13 @@ public:
     }
 
     bool has_reader_after_bypassed_load(size_t entry) const {
+        // CONFIDENCE: HIGH -- a read reached only by the bypass still sees its pre-load
+        // definition. The CFG emitter writes Function storage only in executed writer blocks;
+        // the structured emitter keeps the skipped edge's pre-branch state. Neither executes
+        // this load on that edge. Refuse only when the same physical word can reach the reader
+        // un-overwritten from BOTH the load and bypass paths; that is a real lifetime join.
+        std::vector<uint16_t> loaded_live;
+        if (!loaded_words_at_instructions(loaded_live)) return true;
         std::vector<RawWideState> pending{{entry,
             static_cast<uint16_t>((1u << words) - 1u)}};
         std::unordered_set<uint64_t> visited;
@@ -499,14 +506,15 @@ public:
             const Rdna2Inst& in = ins[state.index];
             if (in.fmt == Rdna2Format::Unknown || !in.len_dwords) return true;
             if (in.is_end) continue;
+            const uint16_t joined_live = state.live & loaded_live[state.index];
             const uint32_t implicit = scalar_implicit_destination_read_width(in);
-            if (implicit && overlaps(in.dst.value, implicit, state.live)) return true;
+            if (implicit && overlaps(in.dst.value, implicit, joined_live)) return true;
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const Operand& operand = in.src[source];
                 if ((operand.kind == OperandKind::SGPR ||
-                     (operand.kind == OperandKind::Special &&
-                      operand.value >= 106 && operand.value <= 124)) &&
-                    overlaps(operand.value, source_width(in, source), state.live))
+                     (operand.kind == OperandKind::Special && operand.value >= 106 &&
+                      operand.value <= 124)) &&
+                    overlaps(operand.value, source_width(in, source), joined_live))
                     return true;
             }
             const uint16_t live = kill_written_words(in, state.live);
@@ -523,6 +531,35 @@ private:
     uint32_t words;
     bool wave64_;
     mutable Blocker backing_blocker_, numeric_blocker_;
+
+    // MAY live words at each instruction BEFORE its reads/writes. Each state names physical
+    // destination words, not derived arithmetic: the bypass question is whether this load's
+    // definition itself joins a pre-load definition. Reads do not end that lifetime; complete
+    // physical overwrites do. Branches (including loops) propagate to a fixed point.
+    bool loaded_words_at_instructions(std::vector<uint16_t>& live_at) const {
+        live_at.assign(ins.size(), 0u);
+        std::vector<RawWideState> pending;
+        if (start + 1 < ins.size())
+            pending.push_back({start + 1, static_cast<uint16_t>((1u << words) - 1u)});
+        std::unordered_set<uint64_t> visited;
+        while (!pending.empty()) {
+            const RawWideState state = pending.back();
+            pending.pop_back();
+            if (!state.live || state.index >= ins.size() || state.index == start) continue;
+            const uint64_t key = (static_cast<uint64_t>(state.index) << 8u) | state.live;
+            if (!visited.insert(key).second) continue;
+            if (visited.size() > 8192) return false;
+            const Rdna2Inst& in = ins[state.index];
+            if (in.fmt == Rdna2Format::Unknown || !in.len_dwords ||
+                rdna2_may_write_unnamed_register_or_leave_cfg(in))
+                return false;
+            if (in.is_end) continue;
+            live_at[state.index] |= state.live;
+            const uint16_t live = kill_written_words(in, state.live);
+            if (live && !enqueue_successors(in, state.index, live, pending)) return false;
+        }
+        return true;
+    }
 
     // Whether every execution of this load reads the same bytes: an immediate offset from a base
     // pair that no instruction ever writes, in a program that cannot write guest memory at all.
@@ -704,6 +741,13 @@ private:
     }
 
     uint16_t kill_written_words(const Rdna2Inst& in, uint16_t live) const {
+        // The writer inventory reports MAY writes. A conditional move preserves the old
+        // physical word when SCC=false, so it cannot end a MAY-loaded lifetime without a
+        // separate predicate proof. Keep both B64 words live as well as the B32/MOVK word.
+        if ((in.fmt == Rdna2Format::SOP1 &&
+             (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64)) ||
+            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32))
+            return live;
         for_each_scalar_write(
             in,
             [&](int base, uint32_t width) {
@@ -879,9 +923,9 @@ static std::vector<uint32_t> proven_immediate_wide_data_loads(const std::vector<
             // CPU upload was captured.
             if ((owned_read_point || in.pc < load.pc) && rdna2_may_write_guest_memory(in))
                 stable_entry_pointer = false;
-            // A predecessor may bypass the load only if every bypass path overwrites all
-            // would-be loaded words before reading them. This admits branch-to-after-region
-            // shapes without allowing a joined reader to see a fabricated definition.
+            // A bypass-only reader keeps its pre-load definition. A reader reachable from
+            // both paths must overwrite the same physical word first, so a lifetime join
+            // cannot turn an absent load into a fabricated definition.
             if (in.pc < load.pc && in.fmt == Rdna2Format::SOPP &&
                 sopp_opcode_is_direct_branch(in.opcode)) {
                 const int64_t target = static_cast<int64_t>(in.pc) +
