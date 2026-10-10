@@ -806,3 +806,53 @@ TEST(Pad, VibrationQuirkAcknowledged) {
     EXPECT_EQ(quirk(1, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(quirk(0, 0, 0, 0, 0, 0), 0u);
 }
+
+TEST(Pad, TriggerEffectEncoding) {
+    printf("== test_pad trigger-effect encoding ==\n");
+
+    uint8_t command[56] = {};
+    uint8_t payload[11] = {};
+    uint8_t rumble = 0;
+
+    // Mode 1 (feedback from a zone to the end): zones 0..9 at strength 5 -> 0x21 simple feedback.
+    command[0] = 1;
+    command[8] = 0;   // first active zone
+    command[9] = 5;   // strength (1..8)
+    CHECK(pad_encode_trigger_effect(command, payload, &rumble), "mode 1 encodes a real effect");
+    CHECK(payload[0] == 0x21, "mode 1 -> 0x21 simple-feedback family");
+    CHECK(payload[1] == 0xFF && payload[2] == 0x03, "mode 1 activates all ten zones");
+    CHECK(rumble == 160, "mode 1 strength 5 -> 160/255 fallback");
+    CHECK(!pad_encode_trigger_effect(command, nullptr, &rumble), "a null payload is rejected");
+    CHECK(rumble == 0, "a rejected encode clears the fallback strength");
+
+    // Mode 2 (weapon wall between two zones) is written directly, not zone-packed.
+    std::memset(command, 0, sizeof(command));
+    command[0] = 2;
+    command[8] = 2; command[9] = 4; command[10] = 6;
+    CHECK(pad_encode_trigger_effect(command, payload, &rumble), "mode 2 encodes a real effect");
+    CHECK(payload[0] == 0x25 && payload[1] == 0x14 && payload[3] == 5,
+          "mode 2 -> 0x25 with zones 2|4 and strength-1");
+    CHECK(rumble == 192, "mode 2 strength 6 -> 192/255 fallback");
+
+    // An unknown mode writes the no-effect marker and reports no effect.
+    std::memset(command, 0, sizeof(command));
+    command[0] = 9;
+    CHECK(!pad_encode_trigger_effect(command, payload, &rumble), "mode 9 is no effect");
+    CHECK(payload[0] == 0x05, "an unknown mode writes the 0x05 no-effect marker");
+
+    // Mode 6 needs a nonzero frequency; zero is the no-effect marker, not a silent vibration.
+    std::memset(command, 0, sizeof(command));
+    command[0] = 6;
+    command[8] = 0;   // frequency
+    CHECK(!pad_encode_trigger_effect(command, payload, &rumble), "mode 6 frequency 0 is no effect");
+
+    // The HLE handlers validate the handle before reading the parameter.
+    register_builtin_hle();
+    HleFn vibration = Hle::lookup(nid_hash("scePadSetVibration"));
+    HleFn trigger_effect = Hle::lookup(nid_hash("scePadSetTriggerEffect"));
+    ASSERT_NE(vibration, nullptr) << "scePadSetVibration must be registered";
+    ASSERT_NE(trigger_effect, nullptr) << "scePadSetTriggerEffect must be registered";
+    constexpr uint64_t invalid_handle = 0xffffffff80920003ull;
+    EXPECT_EQ(vibration(0x7fffffff, 0, 0, 0, 0, 0), invalid_handle);
+    EXPECT_EQ(trigger_effect(0x7fffffff, 0, 0, 0, 0, 0), invalid_handle);
+}

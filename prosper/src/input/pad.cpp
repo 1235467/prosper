@@ -3,6 +3,7 @@
 // layout is asserted here so a struct-layout regression fails at compile time, not silently in the
 // game. The backend lives in pad_evdev.cpp.
 #include "pad.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
@@ -50,6 +51,106 @@ uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2) {
     if (l2 > kPadTriggerButtonThreshold) b |= SCE_PAD_BUTTON_L2;
     if (r2 > kPadTriggerButtonThreshold) b |= SCE_PAD_BUTTON_R2;
     return b;
+}
+
+// --- DualSense trigger-effect encoding (scePadSetTriggerEffect) ---------------------------------
+// Ported from AnyPS5's libScePad, which reproduces the console's per-mode parameter handling and
+// packs the ten trigger zones into the DualSense HID payload. Pure byte math; no device involved.
+namespace {
+
+// Pack up to ten per-zone strengths (1..8, 0 = inactive) plus an optional frequency into an
+// 11-byte HID effect. mode is the HID family byte (0x21 = simple feedback/resistance, 0x26 = the
+// frequency-carrying variant); 0x05 marks "no effect".
+void encode_zones(uint8_t* dst, uint8_t mode, const uint8_t* strengths, int count, uint8_t frequency) {
+    uint16_t zones = 0;
+    uint32_t packed = 0;
+    for (int i = 0; i < count && i < 10; ++i) {
+        const uint8_t s = strengths[i];
+        if (s == 0 || s > 8) continue;
+        zones = (uint16_t)(zones | (1u << i));
+        packed |= (uint32_t)(s - 1) << (i * 3);
+    }
+    if (zones == 0 || (mode == 0x26 && frequency == 0)) { dst[0] = 0x05; return; }
+    dst[0] = mode;
+    dst[1] = (uint8_t)(zones & 0xFF);
+    dst[2] = (uint8_t)(zones >> 8);
+    std::memcpy(dst + 3, &packed, 4);
+    dst[9] = frequency;
+}
+
+uint8_t max_of(const uint8_t* values, int count) {
+    uint8_t m = 0;
+    for (int i = 0; i < count; ++i) m = std::max(m, values[i]);
+    return m;
+}
+
+// 1..8 (Sony's force scale) -> 0..255 rumble for pads without adaptive triggers.
+uint8_t scale_strength(uint8_t s) {
+    return s == 0 ? 0 : (uint8_t)std::min(255, 32 * std::min<int>(s, 8));
+}
+
+} // namespace
+
+bool pad_encode_trigger_effect(const uint8_t* command, uint8_t payload[11], uint8_t* rumble_strength) {
+    if (payload != nullptr) std::memset(payload, 0, 11);
+    if (rumble_strength != nullptr) *rumble_strength = 0;
+    if (command == nullptr || payload == nullptr) return false;
+    uint32_t mode = 0;
+    std::memcpy(&mode, command, 4);
+    const uint8_t* p = command + 8;
+    uint8_t strength = 0;
+    payload[0] = 0x05;
+    switch (mode) {
+        case 1: {   // feedback: strength from zone p[0] to the end
+            uint8_t strengths[10] = {};
+            if (p[0] <= 9 && p[1] >= 1 && p[1] <= 8) for (int i = p[0]; i < 10; ++i) strengths[i] = p[1];
+            encode_zones(payload, 0x21, strengths, 10, 0);
+            strength = scale_strength(p[1]);
+            break;
+        }
+        case 2: {   // weapon: a resistance wall between zones p[0] and p[1]
+            if (p[0] >= 2 && p[0] <= 7 && p[1] > p[0] && p[1] <= 8 && p[2] >= 1 && p[2] <= 8) {
+                const uint16_t zones = (uint16_t)((1u << p[0]) | (1u << p[1]));
+                payload[0] = 0x25;
+                payload[1] = (uint8_t)(zones & 0xFF);
+                payload[2] = (uint8_t)(zones >> 8);
+                payload[3] = (uint8_t)(p[2] - 1);
+            }
+            strength = scale_strength(p[2]);
+            break;
+        }
+        case 3: {   // vibration: strength from zone p[0], vibrating at frequency p[2]
+            uint8_t strengths[10] = {};
+            if (p[0] <= 9 && p[1] >= 1 && p[1] <= 8) for (int i = p[0]; i < 10; ++i) strengths[i] = p[1];
+            encode_zones(payload, 0x26, strengths, 10, p[2]);
+            strength = scale_strength(p[1]);
+            break;
+        }
+        case 4:     // slope feedback: one strength per zone
+            encode_zones(payload, 0x21, p, 10, 0);
+            strength = scale_strength(max_of(p, 10));
+            break;
+        case 5: {   // multi-position feedback: ramp p[2]..p[3] over zones p[0]..p[1]
+            uint8_t strengths[10] = {};
+            if (p[0] <= 8 && p[1] > p[0] && p[1] <= 9 && p[2] >= 1 && p[2] <= 8 && p[3] >= 1 && p[3] <= 8) {
+                const int dist = p[1] - p[0];
+                for (int i = p[0]; i < 10; ++i)
+                    strengths[i] = i <= p[1] ? (uint8_t)std::lround(p[2] + (p[3] - p[2]) * (i - p[0]) / (double)dist) : p[3];
+            }
+            encode_zones(payload, 0x21, strengths, 10, 0);
+            strength = scale_strength(std::max(p[2], p[3]));
+            break;
+        }
+        case 6:     // slope feedback with frequency p[0], per-zone strengths p[1..10]
+            encode_zones(payload, 0x26, p + 1, 10, p[0]);
+            strength = p[0] == 0 ? 0 : scale_strength(max_of(p + 1, 10));
+            break;
+        default:
+            break;
+    }
+    if (payload[0] == 0x05) return false;
+    if (rumble_strength != nullptr) *rumble_strength = strength;
+    return true;
 }
 
 void pad_fill_data(ScePadData* out, const HostPadState& s, uint64_t timestamp, uint8_t connected_count) {

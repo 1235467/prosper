@@ -10,6 +10,8 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <mutex>
 
 namespace prosper {
@@ -66,10 +68,9 @@ public:
         std::lock_guard<std::mutex> lk(mx_);
         SDL_UpdateGamepads();                    // refresh state (we don't run an SDL event loop)
 
-        SDL_Gamepad*& g = gp_[index];
-        if (g && !SDL_GamepadConnected(g)) { SDL_CloseGamepad(g); g = nullptr; }   // hot-unplug
-        if (!g) g = open_index(index);
+        SDL_Gamepad* g = gamepad(index);
         if (!g) return false;                    // no device at this index
+        refresh_rumble(g);
 
         uint32_t b = 0;
         for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++)
@@ -89,7 +90,63 @@ public:
         return true;
     }
 
+    // Effector output from the libScePad HLE: vibration (SDL rumble) and, on a DualSense, the
+    // adaptive-trigger effects as SDL_SendGamepadEffect's 47-byte effects payload. SDL prepends the
+    // report id (0x02 USB / 0x31 Bluetooth) and the Bluetooth framing, so the payload is exactly the
+    // DS5EffectsState_t body: enable byte, the motors, then the R2/L2 11-byte effects at 10/21.
+    void apply_output(int index, const HostPadOutput& out) override {
+        if (index < 0 || index >= kMaxPads) return;
+        std::lock_guard<std::mutex> lk(mx_);
+        SDL_Gamepad* g = gamepad(index);
+        if (!g) return;
+        output_ = out;
+        send_effects(g, out);
+    }
+
 private:
+    static constexpr Uint32 kRumbleMs = 2000;   // SDL rumble auto-expires; refresh_rumble re-arms it
+    static constexpr auto kRumbleRefresh = std::chrono::milliseconds(700);
+
+    // Open (and hot-plug-track) the index-th currently-connected gamepad, or nullptr. mx_ held.
+    SDL_Gamepad* gamepad(int index) {   // NOLINT(readability-make-member-function-const): opens lazily
+        if (index < 0 || index >= kMaxPads) return nullptr;
+        SDL_Gamepad*& g = gp_[index];
+        if (g && !SDL_GamepadConnected(g)) { SDL_CloseGamepad(g); g = nullptr; }   // hot-unplug
+        if (!g) g = open_index(index);
+        return g;
+    }
+
+    void send_effects(SDL_Gamepad* g, const HostPadOutput& out) {   // mx_ held
+        const bool rumbling = out.vibration_large != 0 || out.vibration_small != 0;
+        SDL_RumbleGamepad(g, (Uint16)(out.vibration_large * 257), (Uint16)(out.vibration_small * 257),
+                          rumbling ? kRumbleMs : 0);
+        last_rumble_ = std::chrono::steady_clock::now();
+        if (!out.trigger_valid) return;
+        if (SDL_GetGamepadType(g) == SDL_GAMEPAD_TYPE_PS5) {
+            // 47-byte DS5 effects payload: 0x04 enables the R2 effect, 0x08 the L2 one.
+            Uint8 effect[47] = {};
+            effect[0] = 0x04 | 0x08;
+            std::memcpy(effect + 10, out.trigger_effect[1], 11);   // R2
+            std::memcpy(effect + 21, out.trigger_effect[0], 11);   // L2
+            SDL_SendGamepadEffect(g, effect, (int)sizeof(effect));
+        } else {
+            // Pads without adaptive triggers get the effect's strength as ordinary trigger rumble
+            // (SDL returns false when the device has none; that is the documented no-op).
+            const bool trigger_rumble = out.trigger_rumble[0] != 0 || out.trigger_rumble[1] != 0;
+            SDL_RumbleGamepadTriggers(g, (Uint16)(out.trigger_rumble[0] * 257),
+                                      (Uint16)(out.trigger_rumble[1] * 257), trigger_rumble ? kRumbleMs : 0);
+        }
+    }
+
+    void refresh_rumble(SDL_Gamepad* g) {   // mx_ held; poll path
+        if (output_.vibration_large == 0 && output_.vibration_small == 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_rumble_ < kRumbleRefresh) return;
+        SDL_RumbleGamepad(g, (Uint16)(output_.vibration_large * 257),
+                          (Uint16)(output_.vibration_small * 257), kRumbleMs);
+        last_rumble_ = now;
+    }
+
     // Open the index-th currently-connected gamepad (SDL instance-id order), or nullptr.
     SDL_Gamepad* open_index(int index) {
         int count = 0;
@@ -101,6 +158,8 @@ private:
     }
     std::mutex mx_;
     std::array<SDL_Gamepad*, kMaxPads> gp_{};
+    HostPadOutput output_;
+    std::chrono::steady_clock::time_point last_rumble_{};
 };
 
 Sdl3PadBackend g_backend;

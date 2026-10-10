@@ -53,6 +53,17 @@ struct HostPadState {
     bool     connected = false;   // is a physical device present
 };
 
+// Host-neutral effector output: the libScePad HLE fills it from the scePadSet* effectors and hands
+// it to the active PadBackend. A backend that cannot drive a field ignores it; the headless default
+// backend ignores everything, so a title's haptics path still runs without a device.
+struct HostPadOutput {
+    uint8_t vibration_large = 0;         // left/strong motor, 0..255
+    uint8_t vibration_small = 0;         // right/weak motor, 0..255
+    bool    trigger_valid   = false;     // a trigger effect payload was set since the last reset
+    uint8_t trigger_effect[2][11] = {};  // DualSense HID trigger effects: [0]=L2, [1]=R2
+    uint8_t trigger_rumble[2] = {};      // 0..255 fallback for pads without adaptive triggers: [0]=L2, [1]=R2
+};
+
 // ---- Sony ABI structs (exact byte layout; asserted in pad.cpp) --------------------------------
 
 // ScePadData — the per-poll controller report (scePadReadState / scePadRead). 120 bytes.
@@ -150,6 +161,14 @@ constexpr uint8_t kPadTriggerButtonThreshold = 0x08;   // ~3% of full travel
 // Return the L2/R2 button bits for analog trigger values past the threshold (0 for both at rest).
 // Shared by every backend so the analog->digital rule lives in one unit-tested place.
 uint32_t pad_trigger_buttons(uint8_t l2, uint8_t r2);
+
+// Encode one scePadSetTriggerEffect command block (the console layout: u32 mode at +0, 52 parameter
+// bytes at +8) into the DualSense's 11-byte HID trigger-effect payload. Modes 1..6 are Sony's effect
+// families; any other mode encodes "no effect". `payload` is always fully written (payload[0] == 0x05
+// means no effect). `rumble_strength` (optional) receives a 0..255 approximation of the effect's
+// resistance for pads that only have trigger rumble. Returns true when a real effect was encoded.
+// Pure and unit-tested; the packing follows AnyPS5's libScePad, measured against the console.
+bool pad_encode_trigger_effect(const uint8_t* command, uint8_t payload[11], uint8_t* rumble_strength);
 
 // ---- Scripted input (PROSPER_PAD_SCRIPT) — pure, unit-tested -----------------------------------
 // A timed controller sequence lets a headless run drive menus and gameplay with no host device
@@ -408,6 +427,13 @@ struct PadBackend {
     // (and out.connected/state are filled); false if none (leave `out` neutral/disconnected).
     // Called on the guest's input-polling thread; implementations must be thread-safe.
     virtual bool poll(int index, HostPadState& out) = 0;
+
+    // Deliver effector output (vibration, adaptive-trigger effects) after a scePadSet* call.
+    // `out` is the complete current effector state for `index`, not a delta, so a backend can
+    // re-send it whenever the host needs (SDL rumble expires, a device reconnects, ...). Called on
+    // the guest's thread from the HLE; implementations must be thread-safe and must not block. The
+    // headless default ignores it.
+    virtual void apply_output(int index, const HostPadOutput& out) { (void)index; (void)out; }
 };
 
 // Install a backend. Non-owning; pass nullptr to restore the built-in connected-neutral default.

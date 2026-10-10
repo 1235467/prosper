@@ -60,8 +60,29 @@ struct PadOpenKey {
 // handle -> the triple it was opened with. Membership is still "this handle is open".
 std::unordered_map<int32_t, PadOpenKey> g_pad_handles;
 
+// Latest effector output for the single logical pad (prosper polls backend index 0 everywhere).
+// The HLE owns the guest ABI and the accumulation of scePadSet* calls; the backend owns host
+// delivery and can re-send this snapshot whenever the host needs. apply_output is called with a
+// copy, outside the lock, so a backend never re-enters this file's mutex.
+std::mutex g_pad_output_mx;
+HostPadOutput g_pad_output;
+
+void pad_publish_output() {
+    HostPadOutput snapshot;
+    {
+        std::lock_guard lock(g_pad_output_mx);
+        snapshot = g_pad_output;
+    }
+    pad_backend()->apply_output(0, snapshot);
+}
+
 constexpr uint64_t kPadErrorInvalidHandle =
     (uint64_t)(int64_t)(int32_t)0x80920003u;
+
+// scePadSet* effectors reject a null parameter — and scePadSetTriggerEffect an unknown mode or mask
+// bit — with SCE_PAD_ERROR_INVALID_ARG, as the console does (AnyPS5's libScePad value).
+constexpr uint64_t kPadErrorInvalidArgument =
+    (uint64_t)(int64_t)(int32_t)0x80920001u;
 
 // Retain handle validity through each input operation so Close cannot retire the handle between
 // validation and its poll/output side effects.
@@ -641,6 +662,64 @@ HLE(pad_class_parse) { if (a2) memset(PW(a2), 0, 8); return 0; }
 // unknown-size struct. CONFIDENCE: LOW — arg/layout unverified; never called on this title.
 HLE(pad_trigger_state) { if (a1) memset(PW(a1), 0, 8); return 0; }
 
+// scePadSetVibration(handle, const ScePadVibrationParam*) -> 0. The parameter is two bytes: the
+// large (strong) motor then the small (weak) motor, 0..255 each. Handed to the backend, which
+// drives the host's rumble (SDL/evdev) and re-arms it as its duration expires.
+HLE(pad_set_vibration) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return kPadErrorInvalidArgument;
+    const uint8_t* param = (const uint8_t*)PW(a1);
+    bool changed = false;
+    {
+        std::lock_guard lock(g_pad_output_mx);
+        changed = g_pad_output.vibration_large != param[0] || g_pad_output.vibration_small != param[1];
+        g_pad_output.vibration_large = param[0];
+        g_pad_output.vibration_small = param[1];
+    }
+    if (changed && padlog()) fprintf(stderr, "[pad] scePadSetVibration large=%u small=%u\n", param[0], param[1]);
+    pad_publish_output();
+    return 0;
+}
+
+// scePadSetTriggerEffect(handle, const ScePadTriggerEffectParam*) -> 0. The console layout: byte 0
+// is the trigger mask (bit 0 = L2, bit 1 = R2), then two 56-byte trigger blocks at +8 (u32 mode at
+// +0, 52 parameter bytes at +8). Modes above 6 are rejected, like the system. Encoded per trigger
+// into the DualSense HID payload; the fallback strength drives plain trigger rumble on pads that
+// have no adaptive triggers.
+HLE(pad_set_trigger_effect) {
+    PadHandleGuard handle(a0);
+    if (!handle.valid()) return kPadErrorInvalidHandle;
+    if (!a1) return kPadErrorInvalidArgument;
+    const uint8_t* bytes = (const uint8_t*)PW(a1);
+    const uint8_t mask = bytes[0];
+    if ((mask & ~0x3u) != 0) return kPadErrorInvalidArgument;
+    HostPadOutput next;
+    {
+        std::lock_guard lock(g_pad_output_mx);
+        next = g_pad_output;
+    }
+    for (int trigger = 0; trigger < 2; ++trigger) {
+        const uint8_t* command = bytes + 8 + 56 * trigger;
+        uint32_t mode = 0;
+        std::memcpy(&mode, command, 4);
+        if (mode > 6) return kPadErrorInvalidArgument;
+        if ((mask & (1u << trigger)) != 0)
+            pad_encode_trigger_effect(command, next.trigger_effect[trigger], &next.trigger_rumble[trigger]);
+    }
+    next.trigger_valid = true;
+    bool changed = false;
+    {
+        std::lock_guard lock(g_pad_output_mx);
+        changed = std::memcmp(&next.trigger_effect, &g_pad_output.trigger_effect, sizeof(next.trigger_effect)) != 0;
+        g_pad_output = next;
+    }
+    if (changed && padlog()) fprintf(stderr, "[pad] scePadSetTriggerEffect mask=0x%x L2=0x%02x R2=0x%02x\n",
+                                     mask, next.trigger_effect[0][0], next.trigger_effect[1][0]);
+    pad_publish_output();
+    return 0;
+}
+
 void register_pad_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("scePadInit", pad_ok);
@@ -654,9 +733,9 @@ void register_pad_hle() {
     R("scePadDeviceClassGetExtendedInformation", pad_ext_info);
     R("scePadReadState", pad_read_state);
     R("scePadRead", pad_read);
-    // Effectors we accept but don't yet drive on the host (vibration/lightbar/motion): return OK so
-    // the game's setup path proceeds. Force feedback via evdev EV_FF is a follow-up.
-    R("scePadSetVibration", pad_ok);
+    // Effectors. Vibration and adaptive-trigger effects are driven on the host through the active
+    // PadBackend (SDL3 gamepad, evdev EV_FF, …); lightbar/motion remain accepted no-ops.
+    R("scePadSetVibration", pad_set_vibration);
     R("scePadSetMotionSensorState", pad_ok);
     R("scePadSetTiltCorrectionState", pad_ok);
     R("scePadSetAngularVelocityDeadbandState", pad_ok);
@@ -669,7 +748,7 @@ void register_pad_hle() {
     // no-op. The firmware's 0x80920005 before scePadInit is not modelled, like its vibration
     // siblings. CONFIDENCE: MED.
     R("scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse", pad_ok);
-    R("scePadSetTriggerEffect", pad_ok);       // DualSense adaptive-trigger effect (output) — accept, no-op
+    R("scePadSetTriggerEffect", pad_set_trigger_effect);  // adaptive triggers -> DualSense HID payload
     R("scePadDeviceClassParseData", pad_class_parse);   // raw device-class report -> "no valid data"
     R("scePadGetTriggerEffectState", pad_trigger_state);// adaptive-trigger state -> zeroed/neutral
     #undef R
