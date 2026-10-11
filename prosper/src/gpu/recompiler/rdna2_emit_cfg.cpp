@@ -17,6 +17,7 @@
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -739,7 +740,7 @@ bool emit_cfg_state_machine(
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
-    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active);
+    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
     const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
@@ -2115,6 +2116,7 @@ bool emit_cfg_state_machine(
         return root >= 0 && root <= 105 ? root : -1;
     };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
+        seed_native_logical_entry_marks(wave64_spilled_halves_in.front(), initial);
         for (const auto& mask : initial.sreg_bool)
             if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
                 wave64_b64_mask_in.front().insert(mask.first);
@@ -2525,7 +2527,8 @@ bool emit_cfg_state_machine(
                     !b.cselect_b64_low_only_pcs.contains(in.pc) &&
                     !(source_is_mask(in.src[0]) && source_is_mask(in.src[1])) &&
                     scalar_alu_result;
-                const bool logical_native_ballot = saved_mask_logical_defines_words(b, in);
+                const bool logical_native_ballot =
+                    saved_mask_logical_defines_words(b, in, scalar_alu_result);
                 const bool quadmask_native_ballot = exact_quadmask;
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
@@ -3653,6 +3656,10 @@ bool emit_cfg_state_machine(
         // validity tag: remove all absent ordinary/special scalar words before emitting a case so
         // an uninitialized M0/SGPR cannot become a valid zero merely by crossing the dispatcher.
         if (entry_wave64_scalar_words) {
+            for (int root : b.native_logical_word_roots)
+                for (int word : {root, root + 1})
+                    if (!entry_wave64_scalar_words->contains(word))
+                        state.unavailable_saved_mask_words.insert(word);
             if (entry_block != UINT32_MAX)
                 load_missing_saved_mask_words(state, wave64_b64_ambiguous_in[entry_block],
                                               *entry_wave64_scalar_words);
@@ -6058,7 +6065,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_lds_fminmax_dispatcher) {
     // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
-    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_dispatch_active);
+    initialize_saved_mask_word_proof(b, ins, code, dwords, initial_dispatch_active, &rs);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);

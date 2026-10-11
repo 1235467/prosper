@@ -38,6 +38,7 @@
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_native_logical_words.hpp"
 
 namespace prosper::gpu {
 
@@ -1942,20 +1943,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t lo = 0, hi = 0;
                     bool have_lo = false, have_hi = false;
                 };
-                auto scalar_word = [&](int reg, uint32_t& value) {
-                    auto current = rs.sreg.find(reg);
-                    if (current != rs.sreg.end()) { value = current->second; return true; }
-                    auto input = rs.sreg_input.find(reg);
-                    if (input != rs.sreg_input.end()) { value = input->second; return true; }
-                    return false;
-                };
                 auto scalar_pair = [&](const Operand& source) {
                     ScalarPair pair;
                     if (source.kind == OperandKind::SGPR ||
                         (source.kind == OperandKind::Special &&
                          source.value >= 106 && source.value < 124)) {
-                        pair.have_lo = scalar_word(source.value, pair.lo);
-                        pair.have_hi = scalar_word(source.value + 1, pair.hi);
+                        pair.have_lo = native_logical_data_word(rs, source.value, pair.lo);
+                        pair.have_hi = native_logical_data_word(rs, source.value + 1, pair.hi);
                     } else if (source.kind == OperandKind::InlineInt) {
                         pair.lo = b.uconst(static_cast<uint32_t>(source.value));
                         pair.hi = b.uconst(source.value < 0 ? UINT32_MAX : 0u);
@@ -2122,21 +2116,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                            : in.opcode == 0x19 ? b.lor(n0, n1)       // nand
                            : in.opcode == 0x1b ? b.land(n0, n1)      // nor
                            : b.logical_not(x);                        // xnor
+                const auto words = native_logical_result_words(b, rs, in, r);
+                if (native_logical_data_demanded(b, in) && (!words[0] || !words[1])) {
+                    b.stage_reject_pc = in.pc;
+                    b.stage_reject_reason = "native-logical-data-words-unavailable";
+                    ok = false;
+                    return true;
+                }
                 if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
                 else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
                                                                        mask_write_clobbers_pair(rs, in.dst.value); }
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;
                        mask_write_clobbers_pair(rs, in.dst.value); }
-                // One exact native subgroup per guest Wave64 also makes the logical result's
-                // architectural SGPR pair available. GTA joins an early scalar EXEC ballot with
-                // a later S_ANDN2_B64 survivor mask and then compares s[56:57] as u64. Preserve
-                // both views from the same Bool; portable/unknown subgroup modes remain mask-only.
-                if (!is_exec(in.dst) && b.is_compute && b.wave_size == 64 &&
-                    b.native_subgroup_size == 64) {
-                    rs.sreg[in.dst.value] = b.native_wave_ballot_half(r, 0);
-                    rs.sreg[in.dst.value + 1] = b.native_wave_ballot_half(r, 1);
-                    rs.sreg_srt.erase(in.dst.value);
-                    rs.sreg_srt.erase(in.dst.value + 1);
+                if (words[0] && words[1]) {
+                    rs.sreg[in.dst.value] = words[0];
+                    rs.sreg[in.dst.value + 1] = words[1];
                 }
                 return true;
             }
