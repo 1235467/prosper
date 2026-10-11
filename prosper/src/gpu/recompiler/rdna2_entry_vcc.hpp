@@ -3,6 +3,7 @@
 // INTERNAL recompiler companion. The two unchanged native entry-VCC proofs were promoted with
 // tools/refactor/promote_internal.py before demanded packet-state behavior was introduced.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include <iterator>
 #include <vector>
 
 namespace prosper::gpu {
@@ -77,11 +78,12 @@ inline bool entry_block_defines_vcc_before_any_read(const std::vector<Rdna2Inst>
 //
 // The proof here is a forward MUST dataflow (`must_fact_at`) per VCC word: "this word has been
 // written since region entry on every path to here". The entry value is dead when every
-// instruction that may read either word runs where BOTH words hold that fact. Deliberately
+// instruction that may read either word runs where its demanded words hold that fact. Deliberately
 // conservative in the same directions as the block-0 proof:
 //   * reads are over-approximated exactly as above (every source slot, the implicit VCC consumers,
-//     the implicit destination reads, and any scalar operand rooted at s99 or higher), and any read
-//     demands the complete pair, even a b32 read of one half;
+//     the implicit destination reads, and any scalar operand rooted at s99 or higher). A proven
+//     B32 read rooted at exactly VCC_LO or VCC_HI demands only that physical word; all other
+//     possible overlaps and unclassified widths still demand the complete pair;
 //   * a write defines a word only when it is unconditional: a `v_cmp_*` into VCC (both words), or
 //     an explicit scalar write of that word through the shared writer inventory, excluding the
 //     conditional moves -- s_cmov_b32/b64 and s_cmovk_i32 keep the old value on one SCC outcome;
@@ -94,6 +96,17 @@ inline bool region_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins
             return operand.value == 106 || operand.value == 107;
         if (operand.kind == OperandKind::SGPR) return operand.value >= 99;
         return false;
+    };
+    // CONFIDENCE: HIGH -- the emitter reads a scalar-written VCC half from its own U32 storage.
+    // Its independently maintained Wave64 MUST scalar/mask filters never reload vcc_var's false
+    // initializer as that data word. A one-word data read cannot observe the untouched sibling.
+    // Narrow only established B32 widths at the exact physical word; retain every old conservative
+    // descriptor/range/stale-source overlap and every implicit mask's complete-pair demand.
+    const auto demanded_words = [&](const Operand& operand, uint32_t width) -> uint8_t {
+        if (!may_name_vcc(operand)) return 0u;
+        if (width == 1u && (operand.value == 106 || operand.value == 107))
+            return static_cast<uint8_t>(1u << (operand.value - 106));
+        return 3u;
     };
     for (const auto& in : ins) {
         if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) return false;
@@ -125,20 +138,24 @@ inline bool region_defines_vcc_before_any_read(const std::vector<Rdna2Inst>& ins
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& in = ins[i];
         if (in.is_end) continue;
-        bool reads = false;
-        for (const Operand& source : in.src) reads |= may_name_vcc(source);
-        reads |= in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07);
-        reads |= in.fmt == Rdna2Format::VOP2 &&
-                 (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a));
+        uint8_t reads = 0u;
+        for (uint32_t source = 0; source < std::size(in.src); ++source)
+            reads |= demanded_words(in.src[source], scalar_alu_source_words(in, source));
+        if ((in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) ||
+            (in.fmt == Rdna2Format::VOP2 &&
+             (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))))
+            reads |= 3u;
         // Keep this implicit-read inventory in step with entry_block_defines_vcc_before_any_read:
         // when V_DIV_FMAS (which reads VCC implicitly) is lowered, it belongs in BOTH lists.
-        reads |= scalar_implicit_destination_read_width(in) != 0 && may_name_vcc(in.dst);
+        const uint32_t implicit = scalar_implicit_destination_read_width(in);
+        if (implicit) reads |= demanded_words(in.dst, implicit);
         // A conditional move into VCC keeps the old value on one outcome: that is a read.
-        reads |= ((in.fmt == Rdna2Format::SOP1 &&
-                   (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64)) ||
-                  (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32)) &&
-                 may_name_vcc(in.dst);
-        if (reads && !(lo_defined[i] && hi_defined[i])) return false;
+        if ((in.fmt == Rdna2Format::SOP1 &&
+             (in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64)) ||
+            (in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32))
+            reads |= demanded_words(
+                in.dst, in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeCmovB64 ? 2u : 1u);
+        if (((reads & 1u) && !lo_defined[i]) || ((reads & 2u) && !hi_defined[i])) return false;
     }
     return true;
 }

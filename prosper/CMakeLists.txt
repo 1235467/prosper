@@ -3433,6 +3433,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_entry_vcc_dead.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_entry_vcc_word_demand
+    SOURCES tests/gpu/recompiler/test_entry_vcc_word_demand.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_wave64_vop3_b32_vcc_read
     SOURCES tests/gpu/recompiler/test_wave64_vop3_b32_vcc_read.cpp
     LIBRARIES prosper_core)
