@@ -1448,13 +1448,7 @@ bool emit_cfg_state_machine(
     // ordinary write can leave a stale mask-half proof attached to an erased slot.
     const int max_observable_vgpr = shader_max_vgpr(ins);
     auto for_each_possible_vector_write = [&](const Rdna2Inst& in, const auto& callback) {
-        if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
-            for (int reg = in.dst.value; reg <= max_observable_vgpr; ++reg) callback(reg);
-            return;
-        }
-        const uint32_t writes = rdna2_vgpr_write_count(in);
-        for (uint32_t word = 0; word < writes; ++word)
-            callback(in.dst.value + static_cast<int>(word));
+        prosper::gpu::for_each_possible_vector_write(in, max_observable_vgpr, callback);
     };
 
     // Direct user-data descriptors are deliberately absent from the initial scalar SSA map: their
@@ -2197,6 +2191,7 @@ bool emit_cfg_state_machine(
                                             SpilledMaskHalves& halves,
                                             SpillSlotDomains& slot_domains, bool& scalar_scc,
                                             const Rdna2Inst& in, bool record_compare) {
+            const auto relay_sources = spilled_vector_source_marks(halves, in, masks, scalar_words);
             auto source_is_scalar_word = [&](const Operand& source) {
                 switch (source.kind) {
                     case OperandKind::InlineInt:
@@ -2727,7 +2722,8 @@ bool emit_cfg_state_machine(
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
-            advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes);
+            advance_defined_slots(halves, in, masks, scalar_words, scalar_writes, vector_writes,
+                                  relay_sources);
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
@@ -6719,7 +6715,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             }
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
-        const LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
+        LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
         LaneSlotLoopCarry lane_slots(rs);   // notes the preheader marks, before the header's
         mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
@@ -7282,7 +7278,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // Recursion handles nesting: the then-block emitter re-enters for inner branches.
         // CONFIDENCE: MED-HIGH — guarded by the test suite + exec-diff; DOLL's two-vccz color-grade
         // PS and nested-vccz lighting PS are the motivating real shaders (#273).
-        auto vget = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+        auto vget = [&](int r) { return vreg_seed(b, rs, r); };
         auto sget = [&](int r) { return scalar_merge_seed(b, rs, r); };
         size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
@@ -7368,7 +7364,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
-            const LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
+            LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
             LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
