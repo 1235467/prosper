@@ -20,6 +20,7 @@
 // declared emitter this run did not actually emit a validated module from, and an absent spirv-val
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
@@ -735,6 +736,38 @@ int main(int argc, char** argv) {
                "no GPU or full-emitter coverage claim) ==\n");
         return 0;
 #endif
+    }
+
+    // #4878: validate the actual absent-entry-VCC dispatcher and its typed one-word storage.
+    // The whole-program wrapper seeds VCC=false and would never exercise this admission gate.
+    for (uint32_t native : {0u, 64u}) {
+        for (uint32_t word : {106u, 107u}) {
+            const uint32_t code[]{0xbe8003aau | (word << 16u), 0xbf820000u, 0xd7460000u,
+                                  0x02150600u | word, 0xbf810000u};
+            std::vector<Rdna2Inst> ins;
+            rdna2_walk(code, std::size(code), ins);
+            SpirvCompute builder;
+            builder.native_subgroup_size = native;
+            builder.begin(4u, nullptr, 64u, 1u, 1u, 64u, 0u, true, true);
+            RegState state;
+            state.exec = builder.btrue();
+            state.scc = builder.bfalse();
+            state.max_vgpr = 0;
+            state.sreg_input[0] = builder.groupid[0];
+            std::vector<uint32_t> module;
+            if (emit_cfg_state_machine(
+                    builder, state, ins, {}, nullptr, true, false,
+                    [](RegState&, const Rdna2Inst&) { return false; }, code, std::size(code), 0u)) {
+                const auto result = state.vreg.find(0);
+                if (result != state.vreg.end()) {
+                    builder.store_output_word(result->second, 1u, 0u);
+                    module = builder.finish();
+                }
+            }
+            const std::string name =
+                "entry_vcc_word_" + std::to_string(word) + (native ? "_native64" : "_portable");
+            dump(dir, name.c_str(), module);
+        }
     }
 
     // Compute ALU (float chain).
